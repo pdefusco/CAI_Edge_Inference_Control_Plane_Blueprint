@@ -12,10 +12,13 @@ outcome available here -- considerably worse than failing to boot.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -52,6 +55,36 @@ class Settings:
 
     registry_impl: str = "fake"
 
+    # -- the CAI registry adapter, read always but only validated when it is the
+    # selected implementation ---------------------------------------------
+    #
+    # `registry_domain` has no default and never will. This repo is public and a
+    # registry hostname is a tenant identifier, so the operator either names the
+    # host or names a CDP environment and lets the cdp CLI discover it.
+    registry_domain: str | None = None
+    registry_environment: str | None = None
+    registry_api_prefix: str = "/api/v2"
+
+    # Where the UMS workload JWT comes from. "cli" shells out to `cdp`, which is
+    # what a CAI Session has; "env" and "file" exist for anywhere that does not,
+    # and hand the refresh problem to whatever supplies the value.
+    registry_token_source: str = "cli"
+    registry_token_env: str | None = None
+    registry_token_file: Path | None = None
+    registry_workload_name: str = "DE"
+
+    # Metadata calls are quick; an artifact download is not, and shares the
+    # agent's reasoning at keeper/config.py for the same split.
+    registry_request_timeout: int = 30
+    registry_stream_timeout: int = 900
+
+    registry_verify_tls: bool = True
+    registry_ca_bundle: Path | None = None
+
+    # Model metadata is cached this long inside the adapter. Deployment-time
+    # resolution deliberately ignores it -- see ModelRegistry.get_version.
+    registry_cache_ttl_seconds: int = 30
+
     # Connectivity thresholds, derived from heartbeat age at read time (spec SS14).
     heartbeat_interval_seconds: int = 10
     online_threshold_seconds: int = 30
@@ -62,8 +95,12 @@ class Settings:
     artifact_cache_max_bytes: int = 8 * 1024**3
     artifact_chunk_size: int = 1024 * 1024
 
-    # "proxy" streams bytes through this process (the path that must work);
-    # "presigned" is a config-gated optimization that is allowed to fail.
+    # "proxy" streams bytes through this process. It is the only implemented
+    # transport and the only one that can work for a device with no object-store
+    # identity, which is the whole point of the byte proxy. "presigned" is
+    # reserved: the CAI registry API offers no signed URL to forward, so nothing
+    # reads this field yet. Accepted so a deployment that sets it does not fail
+    # to boot, but it changes no behavior.
     artifact_transport: str = "proxy"
 
     admin_token: str | None = None
@@ -102,6 +139,100 @@ def load_settings(environ: dict[str, str] | None = None) -> Settings:
         os.environ.update(prev)
 
 
+def _load_registry(settings: Settings) -> None:
+    """Read the CAI adapter's settings, and validate them if it is the one wired in.
+
+    Validation is gated on `registry_impl` rather than on `env` so that a local
+    run against the real registry (the normal way to debug it from a Session) gets
+    the same checks as production, and so that `LIGHTHOUSE_REGISTRY=fake` inside
+    CAI stays usable without inventing a domain.
+    """
+    settings.registry_domain = (os.environ.get("LIGHTHOUSE_REGISTRY_DOMAIN") or "").strip() or None
+    settings.registry_environment = (
+        os.environ.get("LIGHTHOUSE_REGISTRY_ENVIRONMENT") or ""
+    ).strip() or None
+    settings.registry_api_prefix = "/" + os.environ.get(
+        "LIGHTHOUSE_REGISTRY_API_PREFIX", "/api/v2"
+    ).strip().strip("/")
+
+    settings.registry_token_source = (
+        os.environ.get("LIGHTHOUSE_REGISTRY_TOKEN_SOURCE", "cli").strip().lower()
+    )
+    settings.registry_token_env = (
+        os.environ.get("LIGHTHOUSE_REGISTRY_TOKEN_ENV") or ""
+    ).strip() or None
+    token_file = (os.environ.get("LIGHTHOUSE_REGISTRY_TOKEN_FILE") or "").strip()
+    settings.registry_token_file = Path(token_file).expanduser() if token_file else None
+    settings.registry_workload_name = (
+        os.environ.get("LIGHTHOUSE_REGISTRY_WORKLOAD_NAME", "DE").strip().upper()
+    )
+
+    settings.registry_request_timeout = _env_int("LIGHTHOUSE_REGISTRY_REQUEST_TIMEOUT", 30)
+    settings.registry_stream_timeout = _env_int("LIGHTHOUSE_REGISTRY_STREAM_TIMEOUT", 900)
+    settings.registry_verify_tls = _env_bool("LIGHTHOUSE_REGISTRY_VERIFY_TLS", True)
+    ca_bundle = (os.environ.get("LIGHTHOUSE_REGISTRY_CA_BUNDLE") or "").strip()
+    settings.registry_ca_bundle = Path(ca_bundle).expanduser() if ca_bundle else None
+    settings.registry_cache_ttl_seconds = _env_int("LIGHTHOUSE_REGISTRY_CACHE_TTL", 30)
+
+    if settings.registry_impl != "cai":
+        return
+
+    if settings.registry_domain and settings.registry_environment:
+        raise ConfigError(
+            "Set LIGHTHOUSE_REGISTRY_DOMAIN or LIGHTHOUSE_REGISTRY_ENVIRONMENT, not both.\n"
+            "Naming the host skips discovery; naming the environment discovers the host "
+            "via `cdp ml list-model-registries`. Setting both leaves it ambiguous which "
+            "registry was intended."
+        )
+    if not settings.registry_domain and not settings.registry_environment:
+        raise ConfigError(
+            "The CAI registry adapter needs to know which registry to talk to.\n"
+            "Set LIGHTHOUSE_REGISTRY_DOMAIN to its hostname, or set "
+            "LIGHTHOUSE_REGISTRY_ENVIRONMENT to a CDP environment name and let "
+            "`cdp ml list-model-registries` discover the host. There is deliberately "
+            "no default: a registry hostname identifies a tenant."
+        )
+
+    if settings.registry_token_source not in {"cli", "env", "file"}:
+        raise ConfigError(
+            "LIGHTHOUSE_REGISTRY_TOKEN_SOURCE must be 'cli', 'env' or 'file', got "
+            f"{settings.registry_token_source!r}"
+        )
+    if settings.registry_token_source == "env" and not settings.registry_token_env:
+        raise ConfigError(
+            "LIGHTHOUSE_REGISTRY_TOKEN_SOURCE=env needs LIGHTHOUSE_REGISTRY_TOKEN_ENV "
+            "to name the variable holding the workload JWT."
+        )
+    if settings.registry_token_source == "file" and not settings.registry_token_file:
+        raise ConfigError(
+            "LIGHTHOUSE_REGISTRY_TOKEN_SOURCE=file needs LIGHTHOUSE_REGISTRY_TOKEN_FILE "
+            "to name the file holding the workload JWT."
+        )
+
+    # The flag names a workload type, not the service being called -- any of the
+    # three mints the same general-purpose UMS JWT, and there is no "ML" value.
+    # Rejecting anything else here saves a confusing 401 later.
+    if settings.registry_workload_name not in {"DE", "DF", "OPDB"}:
+        raise ConfigError(
+            "LIGHTHOUSE_REGISTRY_WORKLOAD_NAME must be 'DE', 'DF' or 'OPDB', got "
+            f"{settings.registry_workload_name!r}. The CDP CLI accepts no other value, "
+            "and all three mint the same workload token -- the flag does not name the "
+            "service being called."
+        )
+
+    if settings.registry_ca_bundle and not settings.registry_ca_bundle.is_file():
+        raise ConfigError(
+            f"LIGHTHOUSE_REGISTRY_CA_BUNDLE does not exist: {settings.registry_ca_bundle}"
+        )
+    if not settings.registry_verify_tls:
+        # Not fatal -- a private CAI cluster with an internal CA is a real case --
+        # but it must not pass unremarked.
+        logger.warning(
+            "LIGHTHOUSE_REGISTRY_VERIFY_TLS is off: registry TLS certificates are not "
+            "being checked. Prefer LIGHTHOUSE_REGISTRY_CA_BUNDLE."
+        )
+
+
 def _load() -> Settings:
     env = os.environ.get("LIGHTHOUSE_ENV", "local").strip().lower()
     if env not in {"local", "cai"}:
@@ -119,6 +250,8 @@ def _load() -> Settings:
     settings.registry_impl = os.environ.get("LIGHTHOUSE_REGISTRY", "cai" if env == "cai" else "fake")
     if settings.registry_impl not in {"fake", "cai"}:
         raise ConfigError(f"LIGHTHOUSE_REGISTRY must be 'fake' or 'cai', got {settings.registry_impl!r}")
+
+    _load_registry(settings)
 
     settings.heartbeat_interval_seconds = _env_int("LIGHTHOUSE_HEARTBEAT_INTERVAL", 10)
     settings.online_threshold_seconds = _env_int("LIGHTHOUSE_ONLINE_THRESHOLD", 30)

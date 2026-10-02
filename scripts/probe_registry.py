@@ -331,33 +331,83 @@ def probe_api_spec(domain, token):
         if not (200 <= status < 300 and marker):
             continue
 
+        # The prefix matters more than it looks: the spec declares paths like
+        # `/models` while `/api/v2/models` is what actually answers, so the
+        # adapter's URL construction comes from basePath, not from the paths.
+        print("\n[spec] version/prefix:")
+        for key in ("swagger", "openapi", "basePath"):
+            if body.get(key):
+                print(f"  {key} = {body[key]}")
+        for srv in (body.get("servers") or [])[:3]:
+            print(f"  server.url = {srv.get('url')}")
+        if not body.get("basePath") and not body.get("servers"):
+            print("  (no basePath/servers declared -- prefix is the gateway's)")
+
         paths = body.get("paths") or {}
-        print(f"\n[spec] {len(paths)} paths. Model/version-related ones:")
+        print(f"\n[spec] all {len(paths)} paths:")
         for p in sorted(paths):
-            if re.search(r"model|version|artifact", p, re.I):
-                verbs = ",".join(sorted(
-                    v.upper() for v in paths[p] if v.lower() in
-                    ("get", "post", "put", "patch", "delete")
-                ))
-                print(f"  {verbs:<18} {p}")
+            verbs = ",".join(sorted(
+                v.upper() for v in paths[p] if v.lower() in
+                ("get", "post", "put", "patch", "delete")
+            ))
+            print(f"  {verbs:<18} {p}")
+
+        # The artifact route decides whether the control plane can broker bytes
+        # through the registry API or needs its own object-store identity, which
+        # is a load-bearing difference for the byte proxy. So print its full
+        # response contract rather than just its existence.
+        for p in sorted(paths):
+            if p.endswith("/artifact"):
+                print(f"\n[spec] {p} -- response contract:")
+                spec_get = (paths[p].get("get") or {})
+                for code, resp in sorted((spec_get.get("responses") or {}).items()):
+                    desc = (resp.get("description") or "").strip()[:60]
+                    schema = resp.get("schema") or (
+                        next(iter((resp.get("content") or {}).values()), {}) or {}
+                    ).get("schema") or {}
+                    ref = schema.get("$ref", "").split("/")[-1]
+                    typ = schema.get("type") or ref or ""
+                    ctypes = ",".join((resp.get("content") or {}).keys())
+                    print(f"  {code}  {desc}  {typ} {ctypes}".rstrip())
+                produces = spec_get.get("produces")
+                if produces:
+                    print(f"  produces: {', '.join(produces)}")
+                for prm in (spec_get.get("parameters") or []):
+                    print(f"  param: {prm.get('name')} in={prm.get('in')}")
 
         schemas = (body.get("components") or {}).get("schemas") or body.get("definitions") or {}
-        wanted = [
-            n for n in sorted(schemas)
-            if re.search(r"model|version|artifact", n, re.I)
-        ]
-        print(f"\n[spec] {len(schemas)} schemas; {len(wanted)} model/version-related:")
-        for name in wanted:
-            props = (schemas[name].get("properties") or {})
+
+        def fmt(meta):
+            """Render a property's type, following one $ref and showing enums."""
+            ref = meta.get("$ref", "").split("/")[-1]
+            typ = meta.get("type") or ref or "?"
+            if typ == "array":
+                inner = meta.get("items") or {}
+                iref = inner.get("$ref", "").split("/")[-1]
+                typ = f"array<{inner.get('type') or iref or '?'}>"
+            if meta.get("enum"):
+                typ += "  enum=" + ",".join(str(e) for e in meta["enum"][:12])
+            if meta.get("format"):
+                typ += f"  ({meta['format']})"
+            return typ
+
+        # Every schema, not a filtered subset. The earlier pass filtered on
+        # name and so hid Status's enum and the MLFlow metadata -- i.e. exactly
+        # the fields the adapter needs for readiness and for the entrypoint.
+        print(f"\n[spec] all {len(schemas)} schemas:")
+        for name in sorted(schemas):
+            node = schemas[name]
+            props = node.get("properties") or {}
+            required = set(node.get("required") or [])
             if not props:
+                # Bare enums (Status is likely one) have no properties.
+                line = fmt(node)
+                print(f"\n  {name}: {line}")
                 continue
             print(f"\n  {name}:")
             for field, meta in sorted(props.items()):
-                typ = meta.get("type") or meta.get("$ref", "").split("/")[-1] or "?"
-                if typ == "array":
-                    inner = (meta.get("items") or {})
-                    typ += f"<{inner.get('type') or inner.get('$ref','').split('/')[-1] or '?'}>"
-                print(f"    {field:<28} {typ}")
+                mark = "*" if field in required else " "
+                print(f"   {mark}{field:<30} {fmt(meta)}")
         return True
     print("  no spec served at the usual paths")
     return False

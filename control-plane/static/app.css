@@ -1,0 +1,570 @@
+/* Operator console styling.
+
+   One idea drives the colour here: a status badge is the only thing on this page
+   an operator reads at a glance, so the palette is spent almost entirely on
+   governance and connectivity, and everything else stays grey. A dashboard where
+   the buttons are as loud as the states is one where OUT_OF_SYNC does not stand
+   out. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel-2: #1c232c;
+  --line: #2a323d;
+  --ink: #e6edf3;
+  --ink-dim: #9aa7b4;
+  --ink-faint: #6e7d8c;
+
+  --good: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+  --info: #58a6ff;
+  --beam: #ffd666;
+
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding-bottom: 4rem;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 1.05rem;
+  letter-spacing: 0.01em;
+}
+h2 {
+  font-size: 0.95rem;
+}
+h3 {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-dim);
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+.muted {
+  color: var(--ink-dim);
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+}
+.error {
+  color: var(--bad);
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+.warn {
+  color: var(--warn);
+  font-size: 0.85rem;
+}
+
+/* -- top bar -------------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 1.25rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* A lighthouse should sweep. Slow enough not to be a distraction on a screen
+   someone leaves open on a wall. */
+.beacon {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--beam);
+  box-shadow: 0 0 0 0 rgba(255, 214, 102, 0.7);
+  animation: sweep 4s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0%,
+  70%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 214, 102, 0);
+    opacity: 0.55;
+  }
+  35% {
+    box-shadow: 0 0 0 7px rgba(255, 214, 102, 0);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .beacon {
+    animation: none;
+  }
+}
+
+.tag {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.facts {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+  color: var(--ink-dim);
+}
+.facts b {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 0.4rem;
+  background: var(--ink-faint);
+  vertical-align: middle;
+}
+.dot.up {
+  background: var(--good);
+}
+.dot.down {
+  background: var(--bad);
+}
+
+/* -- layout --------------------------------------------------------------- */
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 1.25rem;
+  display: grid;
+  gap: 1.25rem;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.panel-head {
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: start;
+  gap: 0.5rem 1rem;
+}
+.panel-head h2 {
+  grid-column: 1;
+}
+.panel-head .muted {
+  grid-column: 1;
+  max-width: 68ch;
+}
+.panel-actions {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.toggle {
+  color: var(--ink-dim);
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+/* -- buttons and inputs --------------------------------------------------- */
+
+button {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: var(--info);
+  color: #08121e;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink-dim);
+  font-weight: 500;
+}
+button.ghost:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+button.danger {
+  background: transparent;
+  border-color: rgba(248, 81, 73, 0.4);
+  color: var(--bad);
+  font-weight: 500;
+}
+button.danger:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.12);
+}
+
+input,
+select {
+  font: inherit;
+  font-size: 0.85rem;
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+}
+input:focus,
+select:focus {
+  outline: 2px solid var(--info);
+  outline-offset: -1px;
+}
+
+label {
+  display: block;
+  margin: 0.7rem 0 0.25rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-faint);
+}
+
+/* -- sign-in gate --------------------------------------------------------- */
+
+.gate {
+  display: grid;
+  place-items: center;
+  padding: 4rem 1.25rem;
+}
+.gate-card {
+  width: min(420px, 100%);
+}
+.gate-card input {
+  margin: 0.75rem 0;
+}
+.gate-card button {
+  width: 100%;
+}
+
+.card {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+}
+
+/* -- fleet table ---------------------------------------------------------- */
+
+table.fleet {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.fleet th {
+  text-align: left;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-faint);
+  font-weight: 600;
+  padding: 0.6rem 1.1rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.fleet td {
+  padding: 0.7rem 1.1rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.fleet tbody tr {
+  cursor: pointer;
+}
+.fleet tbody tr:hover {
+  background: var(--panel-2);
+}
+.fleet tbody tr.selected {
+  background: var(--panel-2);
+  box-shadow: inset 3px 0 0 var(--info);
+}
+.fleet tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.device-id {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+.device-name {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
+/* The desired/actual pair. Two cells, never merged: the gap between them is the
+   information. */
+.state {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.state .what {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--ink-dim);
+}
+.gen {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--ink-faint);
+}
+.gen.behind {
+  color: var(--warn);
+}
+
+.empty {
+  padding: 1.5rem 1.1rem;
+  color: var(--ink-dim);
+  margin: 0;
+}
+
+/* -- badges --------------------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 0.12rem 0.45rem;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.badge.ok {
+  color: var(--good);
+  background: rgba(63, 185, 80, 0.12);
+  border-color: rgba(63, 185, 80, 0.3);
+}
+.badge.pending {
+  color: var(--warn);
+  background: rgba(210, 153, 34, 0.12);
+  border-color: rgba(210, 153, 34, 0.3);
+}
+.badge.bad {
+  color: var(--bad);
+  background: rgba(248, 81, 73, 0.12);
+  border-color: rgba(248, 81, 73, 0.3);
+}
+.badge.info {
+  color: var(--info);
+  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(88, 166, 255, 0.3);
+}
+.badge.idle {
+  color: var(--ink-dim);
+  background: rgba(154, 167, 180, 0.1);
+  border-color: var(--line);
+}
+
+/* A device mid-transition should look like it is moving. */
+.badge.pending::after {
+  content: " ·";
+  animation: tick 1.2s steps(4, end) infinite;
+}
+@keyframes tick {
+  0% {
+    content: " ·";
+  }
+  33% {
+    content: " ··";
+  }
+  66% {
+    content: " ···";
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .badge.pending::after {
+    animation: none;
+  }
+}
+
+/* -- detail --------------------------------------------------------------- */
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+  padding: 1.1rem;
+}
+
+.detail-grid dl {
+  margin: 0.6rem 0 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.3rem 0.8rem;
+}
+.detail-grid dt {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.detail-grid dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.controls .buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+h3.sub {
+  padding: 0 1.1rem;
+  margin-bottom: 0.5rem;
+}
+
+/* -- events --------------------------------------------------------------- */
+
+ol.events {
+  list-style: none;
+  margin: 0;
+  padding: 0 1.1rem 1.1rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.events li {
+  display: grid;
+  grid-template-columns: 7.5rem 14rem 1fr;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid rgba(42, 50, 61, 0.6);
+  font-size: 0.82rem;
+}
+.events li:last-child {
+  border-bottom: 0;
+}
+
+.events time {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--ink-faint);
+}
+.events .what {
+  color: var(--ink-dim);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .events li {
+    grid-template-columns: 1fr;
+    gap: 0.2rem;
+  }
+  .panel-head {
+    grid-template-columns: 1fr;
+  }
+  .panel-actions {
+    grid-column: 1;
+    grid-row: auto;
+  }
+  table.fleet {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+/* -- enrollment dialog ---------------------------------------------------- */
+
+dialog {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  width: min(460px, calc(100vw - 2rem));
+}
+dialog::backdrop {
+  background: rgba(5, 8, 12, 0.7);
+}
+dialog menu {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin: 1.1rem 0 0;
+  padding: 0;
+}
+
+dialog pre {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0.7rem;
+  margin: 0.75rem 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  color: var(--beam);
+}

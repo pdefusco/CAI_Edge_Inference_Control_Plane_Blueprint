@@ -1,0 +1,187 @@
+{#
+  The dashboard shell.
+
+  Server-rendered content is deliberately almost nothing: identity of the
+  deployment (env, registry, version) and the heartbeat interval, which the page
+  needs in order to explain staleness to a human. Everything else arrives from
+  the same JSON API the operator could curl, so the dashboard cannot show a
+  state the API would not also report -- a dashboard with its own private view
+  of the fleet is a dashboard that can lie.
+
+  No CDN, no build step, no framework. This page is served from inside a CAI
+  Application container which may have no egress at all, and a demo that breaks
+  because unpkg.com is unreachable is not a demo.
+#}
+<title>Lighthouse</title>
+<link rel="stylesheet" href="/static/app.css" />
+<link
+  rel="icon"
+  href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🗼</text></svg>"
+/>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="beacon" aria-hidden="true"></span>
+    <h1>Lighthouse</h1>
+    <span class="tag">edge model governance</span>
+  </div>
+  <div class="facts">
+    <span class="fact" title="Which ModelRegistry implementation is wired in">
+      registry <b id="fact-registry">{{ registry }}</b>
+    </span>
+    <span class="fact">env <b>{{ env }}</b></span>
+    <span class="fact">v{{ version }}</span>
+    <span class="fact" id="health" title="GET /api/v1/health">
+      <span class="dot" id="health-dot"></span><b id="health-text">checking…</b>
+    </span>
+    <button type="button" id="logout" class="ghost" hidden>Sign out</button>
+  </div>
+</header>
+
+<!-- Shown whenever the API answers 401. The admin token is exchanged once for
+     an HttpOnly cookie so it never reaches localStorage or a URL. -->
+<div class="gate" id="gate" hidden>
+  <form class="card gate-card" id="login">
+    <h2>Operator sign-in</h2>
+    <p class="muted">
+      Paste the admin token. <code>make dev</code> prints an ephemeral one at
+      startup; in CAI it is <code>LIGHTHOUSE_ADMIN_TOKEN</code>.
+    </p>
+    <input
+      type="password"
+      id="token"
+      placeholder="lha_…"
+      autocomplete="off"
+      spellcheck="false"
+      required
+    />
+    <button type="submit">Sign in</button>
+    <p class="error" id="login-error" hidden></p>
+  </form>
+</div>
+
+<main id="main" hidden>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Fleet</h2>
+      <p class="muted">
+        Desired and actual state are shown side by side and never merged. Devices
+        heartbeat every {{ poll_interval }}s; this page refreshes every 2s so
+        transitions like <em>STOP_PENDING</em> are visible rather than skipped.
+      </p>
+      <div class="panel-actions">
+        <label class="toggle">
+          <input type="checkbox" id="auto" checked /> live
+        </label>
+        <button type="button" id="refresh" class="ghost">Refresh</button>
+        <button type="button" id="show-enroll" class="ghost">Enroll device</button>
+      </div>
+    </div>
+
+    <table class="fleet">
+      <thead>
+        <tr>
+          <th>Device</th>
+          <th>Link</th>
+          <th>Governance</th>
+          <th>Desired</th>
+          <th>Actual</th>
+          <th>Last seen</th>
+        </tr>
+      </thead>
+      <tbody id="fleet"></tbody>
+    </table>
+    <p class="empty" id="fleet-empty" hidden>
+      No devices enrolled. Use <b>Enroll device</b>, or
+      <code>scripts/register_device.sh</code>.
+    </p>
+  </section>
+
+  <section class="panel" id="detail" hidden>
+    <div class="panel-head">
+      <h2 id="detail-id">device</h2>
+      <p class="muted" id="detail-sub"></p>
+      <div class="panel-actions">
+        <button type="button" id="detail-close" class="ghost">Close</button>
+      </div>
+    </div>
+
+    <div class="detail-grid">
+      <div class="card">
+        <h3>Desired <span class="muted" id="desired-gen"></span></h3>
+        <dl id="desired-dl"></dl>
+      </div>
+      <div class="card">
+        <h3>Actual <span class="muted" id="actual-gen"></span></h3>
+        <dl id="actual-dl"></dl>
+      </div>
+      <div class="card controls">
+        <h3>Control</h3>
+        <label for="model">Model</label>
+        <select id="model"></select>
+        <label for="version">Version</label>
+        <select id="version"></select>
+        <div class="buttons">
+          <button type="button" id="deploy">Deploy</button>
+          <button type="button" id="rollback" class="ghost" disabled>Roll back</button>
+          <button type="button" id="stop" class="ghost">Stop</button>
+          <button type="button" id="revoke" class="danger">Revoke</button>
+        </div>
+        <p class="muted">
+          Stop is reversible and keeps the artifacts on the device. Revoke
+          deletes them.
+        </p>
+        <p class="error" id="control-error" hidden></p>
+      </div>
+    </div>
+
+    <h3 class="sub">Audit trail</h3>
+    <ol class="events" id="device-events"></ol>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Fleet activity</h2>
+      <p class="muted">
+        Every desired-state change and every reported transition, newest first.
+      </p>
+    </div>
+    <ol class="events" id="events"></ol>
+  </section>
+</main>
+
+<!-- The device token is returned exactly once, by design: the server stores only
+     its digest. So this dialog is the only chance to copy it. -->
+<dialog id="enroll">
+  <form id="enroll-form">
+    <h2>Enroll a device</h2>
+    <label for="new-id">Device ID</label>
+    <input id="new-id" placeholder="jetson-orin-01" required spellcheck="false" />
+    <label for="new-name">Display name</label>
+    <input id="new-name" placeholder="Bench Jetson" spellcheck="false" />
+    <label for="new-platform">Platform</label>
+    <input id="new-platform" placeholder="jetson-orin" spellcheck="false" />
+    <p class="error" id="enroll-error" hidden></p>
+    <menu>
+      <button type="button" class="ghost" id="enroll-cancel">Cancel</button>
+      <button type="submit">Enroll</button>
+    </menu>
+  </form>
+  <div id="enroll-result" hidden>
+    <h2>Device token</h2>
+    <p class="warn">
+      Shown once. The server keeps only a SHA-256 of it, so it cannot be
+      recovered — copy it now, or enroll again for a new one.
+    </p>
+    <pre id="new-token"></pre>
+    <menu>
+      <button type="button" id="copy-token" class="ghost">Copy</button>
+      <button type="button" id="enroll-done">Done</button>
+    </menu>
+  </div>
+</dialog>
+
+<script>
+  window.LIGHTHOUSE = { heartbeatInterval: {{ poll_interval }} };
+</script>
+<script src="/static/app.js"></script>

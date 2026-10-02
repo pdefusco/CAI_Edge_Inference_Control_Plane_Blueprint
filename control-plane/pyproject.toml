@@ -1,0 +1,50 @@
+[project]
+name = "lighthouse"
+version = "0.1.0"
+description = "Edge model governance control plane, running as a Cloudera AI Application"
+requires-python = ">=3.11"
+dependencies = [
+    "lighthouse-contracts",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# Only needed by the real CAI adapter (M2). Kept out of the base install so the
+# local harness has no cloud dependencies at all.
+cai = [
+    "boto3>=1.34",
+    "httpx>=0.27",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+lighthouse = "lighthouse.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lighthouse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+  "error::DeprecationWarning",
+  # Starlette wants `httpx2` for its TestClient. Taking that dependency to silence
+  # one import-time notice is not worth it: TestClient-over-httpx is what gives the
+  # end-to-end test a *synchronous* ASGI transport, which is the only reason the
+  # real edge agent can drive the real app in one process. Narrowly scoped so it
+  # cannot hide any other Starlette warning.
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:UserWarning",
+]

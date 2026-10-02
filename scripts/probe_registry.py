@@ -304,6 +304,65 @@ def probe_artifact_location(uri):
         print("  (truncated)")
 
 
+def probe_api_spec(domain, token):
+    """Ask the registry to describe itself.
+
+    This is the one probe that works against an *empty* registry, which matters
+    a lot: the version and artifact_uri shapes are the whole reason this script
+    exists, and with no models registered there is no payload to read them off.
+    A served OpenAPI document gives the adapter its field names and types
+    without needing a single model to exist first.
+    """
+    print("\n=== looking for a served API spec ===")
+    for path in (
+        "/api/v2/openapi.json",
+        "/openapi.json",
+        "/api/v2/swagger.json",
+        "/swagger.json",
+        "/api/v2/api-docs",
+        "/v2/api-docs",
+        "/api/v2/docs",
+    ):
+        status, body = get_json(f"{domain}{path}", token)
+        marker = isinstance(body, dict) and (
+            "openapi" in body or "swagger" in body or "paths" in body
+        )
+        print(f"  {path} -> {status}{'  [spec]' if marker else ''}")
+        if not (200 <= status < 300 and marker):
+            continue
+
+        paths = body.get("paths") or {}
+        print(f"\n[spec] {len(paths)} paths. Model/version-related ones:")
+        for p in sorted(paths):
+            if re.search(r"model|version|artifact", p, re.I):
+                verbs = ",".join(sorted(
+                    v.upper() for v in paths[p] if v.lower() in
+                    ("get", "post", "put", "patch", "delete")
+                ))
+                print(f"  {verbs:<18} {p}")
+
+        schemas = (body.get("components") or {}).get("schemas") or body.get("definitions") or {}
+        wanted = [
+            n for n in sorted(schemas)
+            if re.search(r"model|version|artifact", n, re.I)
+        ]
+        print(f"\n[spec] {len(schemas)} schemas; {len(wanted)} model/version-related:")
+        for name in wanted:
+            props = (schemas[name].get("properties") or {})
+            if not props:
+                continue
+            print(f"\n  {name}:")
+            for field, meta in sorted(props.items()):
+                typ = meta.get("type") or meta.get("$ref", "").split("/")[-1] or "?"
+                if typ == "array":
+                    inner = (meta.get("items") or {})
+                    typ += f"<{inner.get('type') or inner.get('$ref','').split('/')[-1] or '?'}>"
+                print(f"    {field:<28} {typ}")
+        return True
+    print("  no spec served at the usual paths")
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--environment", metavar="NAME",
@@ -351,19 +410,43 @@ def main():
     print(f"\n=== GET /api/v2/models -> {status} ===")
     show("models (redacted)", models)
 
-    # The listing's own shape is unknown; try the likely container keys.
+    # The listing's own shape is unknown; try the likely container keys. Note the
+    # `key in models` test rather than a truthiness test: an empty registry
+    # answers `{"models": null}`, so the key being *present and null* tells us
+    # the container name even with no data -- and warns the adapter that this
+    # field is nullable, which would otherwise be found the hard way by
+    # iterating None in production.
     entries = None
     if isinstance(models, dict):
         for key in ("models", "items", "data", "results", "content"):
-            if isinstance(models.get(key), list):
-                print(f"\n[shape] model list lives under key: {key!r}")
-                entries = models[key]
+            if key in models:
+                val = models[key]
+                if isinstance(val, list):
+                    print(f"\n[shape] model list lives under key: {key!r}")
+                    entries = val
+                elif val is None:
+                    print(f"\n[shape] key {key!r} is present but NULL, not []")
+                    print("        -> the registry is empty, and the adapter must")
+                    print("           coerce null to an empty list rather than")
+                    print("           iterating it.")
                 break
     elif isinstance(models, list):
         print("\n[shape] response is a bare list")
         entries = models
+
     if not entries:
-        print("\nCould not find a model array; paste the block above and stop here.")
+        # No data to read shapes off, so ask the service to describe itself.
+        # This is why an empty registry is not the end of the probe.
+        found_spec = probe_api_spec(domain, token)
+        print("\n" + "=" * 72)
+        if found_spec:
+            print("Registry is empty, but its API spec is above -- that is enough")
+            print("to write the adapter's parsing against. Paste it back.")
+        else:
+            print("Registry is empty and serves no spec, so the version and")
+            print("artifact_uri shapes cannot be learned yet: register one model")
+            print("(M3) and re-run to capture them.")
+        print("=" * 72)
         return
 
     print(f"\n[shape] {len(entries)} model(s); keys on first entry:")

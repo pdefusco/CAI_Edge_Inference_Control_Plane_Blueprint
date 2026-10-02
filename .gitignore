@@ -1,0 +1,27 @@
+# Local dev state: SQLite database, artifact cache, agent state, and -- the reason
+# this entry is first -- the admin token and every device bearer token.
+.dev/
+*.token
+
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model training leftovers (M3): checkpoints and exported artifacts are
+# reproducible from the script and belong in the registry, not in git.
+*.onnx
+*.pt
+*.pth
+mlruns/
+data/
+
+.DS_Store
+.idea/
+.vscode/

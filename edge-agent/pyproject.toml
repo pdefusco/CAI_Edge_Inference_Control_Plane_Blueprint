@@ -1,0 +1,37 @@
+[project]
+name = "keeper"
+version = "0.1.0"
+description = "Lighthouse edge agent: reconciles local model deployment against CAI desired state"
+requires-python = ">=3.10"
+# Deliberately minimal. This installs on a Jetson, so it must not drag in
+# FastAPI, boto3 or anything else the control plane needs.
+dependencies = [
+    "lighthouse-contracts",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# The real runtime, installed on the device in M4. On Jetson this comes from
+# NVIDIA's wheel index rather than PyPI, so it is not a base dependency.
+onnx = [
+    "onnxruntime>=1.17",
+    "numpy>=1.24",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+keeper = "keeper.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keeper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

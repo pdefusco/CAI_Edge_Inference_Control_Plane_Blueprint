@@ -15,6 +15,7 @@ from .base import (
     RegistryModelVersion,
     RegistryUnavailable,
     UnsupportedFlavor,
+    VersionFailed,
     VersionNotReady,
 )
 from .fake import FakeModelRegistry, build_fake_artifact
@@ -30,6 +31,7 @@ __all__ = [
     "RegistryModelVersion",
     "RegistryUnavailable",
     "UnsupportedFlavor",
+    "VersionFailed",
     "VersionNotReady",
     "build_fake_artifact",
 ]

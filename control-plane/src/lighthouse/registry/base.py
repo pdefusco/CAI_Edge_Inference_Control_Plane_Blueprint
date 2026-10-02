@@ -41,6 +41,20 @@ class VersionNotReady(RegistryError):
     Raised rather than returned so a half-written version can never become
     desired state -- a device would download a truncated artifact and fail its
     checksum, which looks like corruption rather than a race.
+
+    Means *retry later*. For a version that will never become ready, see
+    `VersionFailed`.
+    """
+
+
+class VersionFailed(RegistryError):
+    """The registry tried to build this version and gave up.
+
+    Separate from `VersionNotReady` because the two need opposite advice. The
+    real registry's status is not a ready/not-ready pair: `UPLOAD_FAILED` and
+    `DELETE_FAILED` are terminal, and telling an operator to retry a terminal
+    state sends them back to a dashboard that will never change. The remedy is to
+    register a new version.
     """
 
 
@@ -69,10 +83,19 @@ class UnsupportedFlavor(RegistryError):
 class RegistryModelVersion:
     """One version of a registered model, as the control plane needs it.
 
-    `model_id` and `version_uuid` are the registry's own lineage identifiers,
-    parsed out of the artifact URI path. They key the artifact cache, because
-    they are immutable -- unlike the `(name, version)` label, which an operator
-    can repoint at different bytes.
+    `model_id` and `version_uuid` together identify *one specific set of bytes*.
+    They key the artifact cache, because they are immutable -- unlike the
+    `(name, version)` label, which an operator can repoint at different bytes.
+
+    `version_uuid` is not necessarily a UUID, despite the name. It is whatever
+    string the adapter can offer that changes when the bytes change. The real CAI
+    registry has no such field: a version there is just an integer, and integers
+    can be deleted and reissued. So `CAIModelRegistry` composes the version with
+    its creation timestamp, which is what makes a reissued version number read as
+    different bytes rather than silently reusing the cached ones. The fake, which
+    does have stable synthetic ids, uses those. Renaming the field to match that
+    looser meaning is a pending follow-up; it touches two SQLite columns, three
+    independent reconstructions of `cache_key`, and ~30 test references.
     """
 
     name: str
@@ -152,15 +175,28 @@ class ModelRegistry(Protocol):
     def list_versions(self, model_name: str) -> list[RegistryModelVersion]:
         """All versions of a model, oldest first.
 
-        Raises ModelNotFound if the model does not exist.
+        Oldest first is load-bearing: `ModelCatalog` reverses this to present
+        newest-first, and nothing anywhere sorts versions, so an implementation
+        must impose the order rather than pass through whatever the registry
+        returned.
+
+        Raises ModelNotFound if the model does not exist. A version that is
+        unbuilt, failed or unrunnable is *reported* here via `status` and
+        `format`, never raised -- an operator needs to see the broken version in
+        the catalog. Only `get_version` refuses.
         """
         ...
 
     def get_version(self, model_name: str, version: str) -> RegistryModelVersion:
         """Resolve one version.
 
-        Raises ModelNotFound if absent, VersionNotReady if it is not READY, and
+        Raises ModelNotFound if absent, VersionNotReady if it is still being
+        built, VersionFailed if the registry gave up building it, and
         UnsupportedFlavor if it carries nothing the edge can execute.
+
+        This is the deployment-time gate, so implementations must not serve it
+        from a cache: a stale READY here puts bytes into desired state that the
+        registry may already have deleted.
         """
         ...
 

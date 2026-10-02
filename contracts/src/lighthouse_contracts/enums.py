@@ -64,9 +64,17 @@ class Connectivity(StrEnum):
 
 class ArtifactFormat(StrEnum):
     """ONNX is the canonical edge format (spec SS10). TensorRT engines are
-    derived on-device in M6 and are not registry artifacts."""
+    derived on-device in M6 and are not registry artifacts.
+
+    UNKNOWN exists because the real registry cannot always tell us. A version
+    imported from Hugging Face or NGC carries no flavor metadata, so the format
+    is genuinely unknown until the bytes are inspected -- and those versions are
+    never edge-runnable anyway. Saying UNKNOWN keeps them listable (and visibly
+    undeployable) instead of mislabelling them ONNX.
+    """
 
     ONNX = "onnx"
+    UNKNOWN = "unknown"
 
 
 class Packaging(StrEnum):

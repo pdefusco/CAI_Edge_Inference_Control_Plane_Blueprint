@@ -5,6 +5,9 @@ distinctions are the useful part:
 
   * `ModelNotFound` -> **404**: the operator mistyped a name.
   * `VersionNotReady` -> **409**: it exists but isn't built yet. Retry later.
+  * `VersionFailed` -> **409**: the registry tried to build it and gave up. Also
+    a conflict, but the opposite advice -- retrying waits forever, so the detail
+    says to register a new version and carries the registry's own reason.
   * `UnsupportedFlavor` -> **409**: it will never be runnable at the edge. Don't
     retry; the version needs re-exporting. Caught here rather than discovered on
     the device after a download.
@@ -25,6 +28,7 @@ from ..registry import (
     RegistryError,
     RegistryUnavailable,
     UnsupportedFlavor,
+    VersionFailed,
     VersionNotReady,
 )
 
@@ -36,6 +40,14 @@ def registry_http_error(exc: RegistryError) -> HTTPException:
         return HTTPException(
             status.HTTP_409_CONFLICT,
             detail=f"model version is not ready in the registry: {exc}",
+        )
+    if isinstance(exc, VersionFailed):
+        return HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"the registry could not build this model version: {exc}. "
+                "It will not become ready; register a new version."
+            ),
         )
     if isinstance(exc, UnsupportedFlavor):
         return HTTPException(

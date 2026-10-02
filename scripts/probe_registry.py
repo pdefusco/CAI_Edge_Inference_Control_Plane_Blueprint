@@ -1,33 +1,51 @@
 #!/usr/bin/env python3
-"""Probe the CAI model registry from inside a CAI Session, to spec the M2 adapter.
+"""Probe a CAI model registry to spec the M2 adapter.
 
-A CAI workbench with `endpointPublicAccess: false` resolves its registry to a
-private address, so it cannot be called from a laptop. This script runs *in a CAI
-Session inside the workbench* and reports the exact wire shapes
-`registry/cai.py` has to parse:
+A workbench with `endpointPublicAccess: false` resolves its registry to a private
+address, so this runs *in a CAI Session inside that workbench*. It reports the
+exact wire shapes `registry/cai.py` has to parse:
 
   * `GET /api/v2/models`            -> names + `model_id` lineage
   * `GET .../versions`              -> version labels, status, flavors
   * the real `artifact_uri`         -> the prefix shape to parse and resolve
   * what objects actually exist at that prefix (the thing docs don't tell us)
 
-Usage, in a CAI Session terminal. The registry domain is yours, so it is required
-rather than defaulted -- this repo is a blueprint and does not carry anyone's
-hostnames:
+Auth follows the documented CAI chain, not guesswork. The registry sits behind
+CDP's external-authz gateway (`/gateway/cdpauth/auth/api/v1/extauthz/...`), which
+wants a **UMS workload JWT** from the CDP control plane:
 
-    export LIGHTHOUSE_REGISTRY_DOMAIN=https://modelregistry.<your-workbench>
-    python probe_registry.py --token-env CDSW_APIV2_KEY
-    python probe_registry.py --domain https://... --token-env CDSW_APIV2_KEY
-    python probe_registry.py --token-file /tmp/jwt --token-json-key access_token
+    cdp iam generate-workload-auth-token --workload-name DE   ->  ["token"]
+    Authorization: Bearer <that token>
 
-The credential is named explicitly, and exactly one is used. This script does
-not search the session for usable tokens: enumerating a host's credentials and
-trying each against an API is credential scanning whatever the motive, so if the
-first choice is rejected the script says so and stops rather than hunting for
-another. Which credential the registry wants is a docs/admin question.
+`--workload-name DE` is not a typo: the flag accepts only DE/DF/OPDB, and any of
+them mints the same general-purpose UMS JWT. There is no `ML` value, which is
+what makes this look like a dead end if you read the flag as naming the service
+you are calling. A workbench key such as `$CDSW_APIV2_KEY` is scoped to the
+workbench API and this gateway returns 401 for it.
 
-Output is deliberately secret-free: every value that looks like a token, key, or
-signed URL is redacted before printing, so the output is safe to paste back.
+The domain is discovered the same way, rather than hardcoded -- a registry lives
+on its own `ml-<id>` host, which is *not* the session's `$CDSW_DOMAIN`:
+
+    cdp ml list-model-registries   ->  filter environmentName  ->  ["domain"]
+
+Usage, in a CAI Session terminal (needs `pip install cdpcli` and `cdp configure
+set` with your workload user access keys):
+
+    python probe_registry.py --environment my-cdp-env
+    python probe_registry.py --environment my-cdp-env --model fashion-cnn
+    python probe_registry.py --domain https://... --token-env SOME_VAR
+
+Two rules this script keeps:
+
+  * **The token is never printed.** It is minted, passed straight into the
+    Authorization header, and never logged, echoed, or written to disk.
+  * **One credential, named.** It does not search the session for tokens to try,
+    and it does not iterate the registry list looking for one that answers --
+    that list is tenant-wide and most entries belong to other people. You name
+    the environment; it uses that one and stops.
+
+Output is deliberately secret-free: anything resembling a token, key, or signed
+URL is redacted before printing, so the output is safe to paste back.
 """
 
 from __future__ import annotations
@@ -36,19 +54,19 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
 
-# No default domain on purpose. A real registry hostname identifies a specific
-# tenant's private infrastructure, and this file is in a public repo.
 DOMAIN_ENV = "LIGHTHOUSE_REGISTRY_DOMAIN"
 
 # Anything matching these is replaced before printing. The probe's whole value is
 # that its output can be pasted into a chat, which is only true if it cannot leak.
 _SECRET_KEY_RE = re.compile(
     r"(token|secret|password|passwd|credential|api_?key|authorization|session|"
-    r"signature|x-amz-|access_?key)",
+    r"signature|x-amz-|access_?key|private_?key)",
     re.I,
 )
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+")
@@ -84,18 +102,88 @@ def show(label, obj):
     print(json.dumps(redact(obj), indent=2, default=str)[:4000])
 
 
+# -- the cdp CLI -------------------------------------------------------------
+
+
+def _cdp(*args, what: str):
+    """Run a `cdp` subcommand and parse its JSON.
+
+    Returns the parsed object, or exits with a readable message. On failure only
+    *stderr* is shown: stdout can contain a freshly minted JWT, and this script
+    does not print credentials even in error paths.
+    """
+    if shutil.which("cdp") is None:
+        sys.exit(
+            "the `cdp` CLI is not on PATH.\n"
+            "  In a CAI Session: pip install cdpcli, then\n"
+            "  cdp configure set cdp_access_key_id ... / cdp_private_key ..."
+        )
+    proc = subprocess.run(["cdp", *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip()[:400] or f"exit {proc.returncode}"
+        sys.exit(f"{what} failed:\n  {detail}")
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"{what} returned output that is not JSON.")
+
+
+def mint_workload_jwt(workload_name: str) -> str:
+    """Mint a UMS workload JWT. The value is returned, never printed."""
+    payload = _cdp(
+        "iam", "generate-workload-auth-token",
+        "--workload-name", workload_name,
+        what="cdp iam generate-workload-auth-token",
+    )
+    token = payload.get("token")
+    if not token:
+        sys.exit(
+            "the token response had no 'token' field (keys: "
+            f"{sorted(payload)}). Check your cdp configuration."
+        )
+    return str(token).strip()
+
+
+def discover_domain(environment: str) -> str:
+    """Resolve one named environment's registry domain.
+
+    Filters on an exact environmentName the operator supplied. The listing is
+    tenant-wide and mostly other people's registries, so there is deliberately
+    no "just pick the first one" fallback.
+    """
+    payload = _cdp("ml", "list-model-registries", what="cdp ml list-model-registries")
+    registries = payload.get("modelRegistries") or []
+    for reg in registries:
+        if reg.get("environmentName") == environment:
+            domain = reg.get("domain")
+            if not domain:
+                sys.exit(f"{environment!r} has a registry but no domain field yet.")
+            status = reg.get("status")
+            public = reg.get("endpointPublicAccess")
+            print(f"  resolved via cdp ml list-model-registries")
+            print(f"  status={status}  endpointPublicAccess={public}")
+            if status and not str(status).endswith(":finished"):
+                print(f"  ^ not finished provisioning; calls below may fail")
+            return str(domain)
+    names = sorted(r.get("environmentName", "?") for r in registries)
+    sys.exit(
+        f"no registry for environment {environment!r}.\n"
+        f"  {len(names)} registries are visible to you; re-run with one of their\n"
+        f"  environment names if {environment!r} is a typo."
+    )
+
+
 # -- credentials -------------------------------------------------------------
 #
-# ONE credential, named explicitly by the operator via --token-env or
-# --token-file. This script deliberately does NOT search the environment for
-# usable tokens: enumerating every credential on a host and trying each against
-# an API is credential scanning, regardless of intent, and it is not a thing a
-# repo should carry. If you do not know which credential the registry wants,
-# check the CAI docs or ask your admin -- then name it here.
+# ONE credential. By default the documented CDP chain above; otherwise exactly
+# the env var or file the operator named. This script deliberately does NOT
+# search the environment for usable tokens: enumerating every credential on a
+# host and trying each against an API is credential scanning regardless of
+# intent, and it is not a thing a repo should carry.
 
 
-def load_token(args):
-    """Return (label, token) from the single source the operator named."""
+def load_token(args) -> tuple[str, str]:
+    """Return (label, token) from the single source the operator chose."""
     if args.token_env:
         val = os.environ.get(args.token_env)
         if not val:
@@ -125,7 +213,10 @@ def load_token(args):
                 f"Re-run naming one, e.g. --token-json-key access_token"
             )
         return f"file:{args.token_file}", raw
-    return None, None
+    return (
+        f"cdp UMS workload JWT (--workload-name {args.workload_name})",
+        mint_workload_jwt(args.workload_name),
+    )
 
 
 def get_json(url, token, timeout=20):
@@ -140,28 +231,29 @@ def get_json(url, token, timeout=20):
             except json.JSONDecodeError:
                 return resp.status, {"<non-json body>": body[:300].decode(errors="replace")}
     except urllib.error.HTTPError as exc:
-        detail = exc.read()[:300].decode(errors="replace")
+        detail = exc.read()[:400].decode(errors="replace")
         return exc.code, {"<error body>": detail}
     except Exception as exc:  # network-level
         return 0, {"<exception>": f"{type(exc).__name__}: {exc}"}
 
 
 def check_auth(domain, label, token):
-    """Report how the named credential fares. One credential, one request."""
+    """Report how the chosen credential fares. One credential, one request."""
     url = f"{domain.rstrip('/')}/api/v2/models"
     print("\n=== auth check ===")
-    if token is None:
-        status, _ = get_json(url, None)
-        print(f"  (no credential given)  -> {status}")
-        print("  If this is 401/403, re-run with --token-env VAR or --token-file PATH")
-        print("  naming the credential the registry expects.")
-        return status
-    status, _ = get_json(url, token)
+    status, body = get_json(url, token)
     print(f"  {label}  -> {status}   (value never printed)")
     if status in (401, 403):
-        print("  Rejected. That is a useful finding: report it rather than")
-        print("  trying other credentials -- the adapter needs the *right* one,")
-        print("  which is a docs/admin question, not a guessing game.")
+        err = json.dumps(redact(body))
+        if "extauthz" in err or "cdpauth" in err:
+            print("  The CDP authz gateway rejected it. A workbench-scoped key")
+            print("  (CDSW_APIV2_KEY) always 401s here -- it needs the UMS")
+            print("  workload JWT, which is this script's default. Drop")
+            print("  --token-env/--token-file and re-run.")
+        else:
+            print("  Rejected. Report the code rather than trying other")
+            print("  credentials: the adapter needs the *right* one, which is a")
+            print("  docs/admin question, not a guessing game.")
     return status
 
 
@@ -176,7 +268,7 @@ def probe_artifact_location(uri):
     reports the real object layout so that resolution can be written correctly
     instead of guessed.
     """
-    print(f"\n--- objects at artifact_uri " + "-" * 37)
+    print("\n--- objects at artifact_uri " + "-" * 37)
     if not uri:
         print("  (no artifact_uri to probe)")
         return
@@ -188,7 +280,7 @@ def probe_artifact_location(uri):
     print(f"  scheme={scheme}  bucket={bucket}")
     print(f"  prefix={prefix}")
     if scheme not in ("s3", "s3a"):
-        print(f"  non-S3 scheme; adapter needs the matching SDK, not boto3")
+        print("  non-S3 scheme; adapter needs the matching SDK, not boto3")
         return
     try:
         import boto3  # noqa: PLC0415
@@ -214,32 +306,40 @@ def probe_artifact_location(uri):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--domain",
-        default=os.environ.get(DOMAIN_ENV),
-        help=f"registry base URL; defaults to ${DOMAIN_ENV}",
-    )
+    ap.add_argument("--environment", metavar="NAME",
+                    help="CDP environment whose registry to probe (resolves --domain)")
+    ap.add_argument("--domain", default=os.environ.get(DOMAIN_ENV),
+                    help=f"registry base URL; else ${DOMAIN_ENV}, else --environment")
     ap.add_argument("--model", default=None, help="focus a single model name")
+    ap.add_argument("--workload-name", default="DE", choices=("DE", "DF", "OPDB"),
+                    help="workload name for the UMS token mint (any mints the same JWT)")
     src = ap.add_mutually_exclusive_group()
-    src.add_argument("--token-env", metavar="VAR", help="env var holding the bearer token")
-    src.add_argument("--token-file", metavar="PATH", help="file holding the bearer token")
-    ap.add_argument("--token-json-key", metavar="KEY", help="if --token-file is JSON, the key to use")
+    src.add_argument("--token-env", metavar="VAR", help="use this env var instead of minting")
+    src.add_argument("--token-file", metavar="PATH", help="use this file instead of minting")
+    ap.add_argument("--token-json-key", metavar="KEY", help="if --token-file is JSON, the key")
     args = ap.parse_args()
 
-    if not args.domain:
-        ap.error(
-            f"no registry domain. Pass --domain or set ${DOMAIN_ENV}.\n"
-            "  In a CAI Session it is usually https://modelregistry.<the CDSW_DOMAIN\n"
-            "  of this workbench>; check the Model Registry page in the CAI UI."
-        )
-    domain = args.domain.rstrip("/")
     print("=" * 72)
     print("CAI model registry probe")
     print("=" * 72)
-    print(f"domain: {domain}")
-    for var in ("CDSW_PROJECT", "CDSW_DOMAIN", "CDSW_ENGINE_ID", "CDSW_APP_PORT"):
+    for var in ("CDSW_PROJECT", "CDSW_DOMAIN", "CDSW_ENGINE_ID"):
         if os.environ.get(var):
             print(f"  {var}={os.environ[var]}")
+
+    if not args.domain:
+        if not args.environment:
+            ap.error(
+                f"need a registry. Pass --environment NAME (recommended; resolves\n"
+                f"  the domain via cdp ml list-model-registries), or --domain URL,\n"
+                f"  or set ${DOMAIN_ENV}."
+            )
+        print(f"\n=== resolving the registry for {args.environment!r} ===")
+        args.domain = discover_domain(args.environment)
+    domain = args.domain.rstrip("/")
+    print(f"\ndomain: {domain}")
+    if os.environ.get("CDSW_DOMAIN") and os.environ["CDSW_DOMAIN"] not in domain:
+        print("  (note: a different host from $CDSW_DOMAIN -- expected; the")
+        print("   registry is its own workspace)")
 
     label, token = load_token(args)
     status = check_auth(domain, label, token)
@@ -285,7 +385,7 @@ def main():
     for key in ("id", "model_id", "modelId", "uuid", "crn"):
         if target.get(key):
             model_id = target[key]
-            print(f"\n[shape] model identifier key: {key!r} = {model_id}")
+            print(f"\n[shape] model identifier key: {key!r}")
             break
     if not model_id:
         print("\nNo id-like key on the model entry; paste the block above.")

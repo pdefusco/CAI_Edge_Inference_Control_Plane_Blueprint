@@ -47,9 +47,11 @@ import json
 import logging
 import subprocess
 import time
+from pathlib import Path
 
 import httpx
 import pytest
+from lighthouse_contracts import ArtifactFormat, Packaging
 
 from lighthouse.config import ConfigError, Settings
 from lighthouse.registry.base import (
@@ -65,6 +67,7 @@ from lighthouse.registry.cai import (
     CAIModelRegistry,
     CAIRegistryClient,
     CdpCliTokenProvider,
+    _format_and_packaging,
     discover_domain,
 )
 
@@ -457,6 +460,128 @@ def test_tags_arrive_as_pairs_and_become_a_mapping():
     mv = registry.get_version("fashion-cnn", "1")
 
     assert mv.tags == {"team": "vision", "stage": "prod"}
+
+
+# --- what `metadata` has to say for a version to be deployable ----------------
+#
+# `_format_and_packaging` is the whole of the deployability decision before any
+# bytes exist, and it is the one part of this adapter that was written against a
+# registry nobody had put a model into yet. These tests pin the parts that are
+# knowable without the tenant, and leave one explicitly-marked slot for the part
+# that is not.
+
+
+def _version_with(metadata: dict):
+    """A registry serving one version whose metadata is exactly `metadata`."""
+    return _route(
+        {
+            ("GET", f"{PREFIX}/models"): httpx.Response(
+                200, json={"models": [_model_entry("model-1", "fashion-cnn")]}
+            ),
+            ("GET", f"{PREFIX}/models/model-1/versions/1"): httpx.Response(
+                200, json=_version_entry(1, metadata=metadata)
+            ),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "repo_type",
+    ["mlflow", "MLFLOW", "MLflow", "MLFLOW_MODEL", "MODEL_REPO_TYPE_MLFLOW", " mlflow "],
+)
+def test_an_enum_shaped_repo_type_still_reads_as_mlflow(repo_type):
+    """The failure this is here to prevent is silent and total.
+
+    `model_repo_type` was only ever observed as the string `"mlflow"`. An API
+    that returns a bare lowercase value in one place very often returns
+    `"MLFLOW_MODEL"` in another, and an exact-equality test answers UNKNOWN for
+    that -- which `get_version` turns into `UnsupportedFlavor` for *every*
+    model in the registry. Nothing about that failure points at this line.
+
+    No `mlflowMetadata` key here on purpose: with one, the second half of the
+    condition would carry the test and the repo_type branch would go
+    unexercised.
+    """
+    registry, _ = _registry_for(_settings(), _version_with({"model_repo_type": repo_type}))
+
+    mv = registry.get_version("fashion-cnn", "1")
+
+    assert mv.format is ArtifactFormat.ONNX
+    assert mv.packaging is Packaging.MLFLOW_TAR_GZ
+
+
+@pytest.mark.parametrize("repo_type", ["hf", "HUGGINGFACE_MODEL", "ngc", "NGC_MODEL"])
+def test_an_enum_shaped_hf_or_ngc_repo_type_is_still_refused(repo_type):
+    """Documents rather than fixes: these already reached UNKNOWN by falling
+    through. Pinned because the token matching above now claims them
+    deliberately, and a later edit that broadened the MLflow branch too far
+    would otherwise flip them to deployable with nothing to catch it."""
+    registry, _ = _registry_for(_settings(), _version_with({"model_repo_type": repo_type}))
+
+    with pytest.raises(UnsupportedFlavor):
+        registry.get_version("fashion-cnn", "1")
+
+
+def test_a_repo_type_that_merely_contains_hf_is_not_read_as_huggingface():
+    """Why tokens and not a substring test. `"hf"` inside a longer word is a
+    false positive, and this one would refuse an MLflow model."""
+    registry, _ = _registry_for(
+        _settings(), _version_with({"model_repo_type": "mlflow-shfmt-pipeline"})
+    )
+
+    assert registry.get_version("fashion-cnn", "1").format is ArtifactFormat.ONNX
+
+
+def test_empty_metadata_is_refused_and_this_is_the_line_m3_may_have_to_change():
+    """Pinning today's behaviour so the change is deliberate when it comes.
+
+    If the tenant reports `{}` for a normally-registered MLflow model, this
+    assertion is what has to be inverted -- and inverting it makes every
+    version in the registry deployable on no evidence at all, which is why it
+    waits on the observed payload rather than on an argument.
+    """
+    registry, _ = _registry_for(_settings(), _version_with({}))
+
+    with pytest.raises(UnsupportedFlavor):
+        registry.get_version("fashion-cnn", "1")
+
+
+# The evidence slot. Deliberately read from `.dev/`, which `.gitignore` has
+# ignored since M2: a real version payload is tenant data and this repo is
+# public, so the one file that would settle this must live somewhere it cannot
+# be committed from. Drop the `metadata` object printed by
+# `scripts/register_model.py` into it and this stops skipping.
+_OBSERVED = (
+    Path(__file__).resolve().parents[2] / ".dev" / "m3" / "observed_version_metadata.json"
+)
+
+
+@pytest.mark.skipif(
+    not _OBSERVED.is_file(),
+    reason=f"no observed registry metadata yet -- write one to {_OBSERVED} "
+    "(the `metadata` object from scripts/register_model.py's findings block)",
+)
+def test_the_observed_metadata_of_a_real_mlflow_version_yields_onnx():
+    """The assertion M3 exists to make, against the real payload.
+
+    Runs the production function on bytes that came off the tenant. A failure
+    here is not a flaky test -- it means a model registered the normal way is
+    undeployable, and the message names which branch of
+    `_format_and_packaging` has to move.
+    """
+    observed = json.loads(_OBSERVED.read_text())
+    metadata = observed.get("metadata", observed)
+    assert isinstance(metadata, dict), f"{_OBSERVED} should hold the metadata object"
+
+    fmt, packaging = _format_and_packaging(metadata)
+
+    assert fmt is ArtifactFormat.ONNX, (
+        f"a real MLflow version reported metadata keys {sorted(metadata)} with "
+        f"model_repo_type={metadata.get('model_repo_type')!r}, which this adapter "
+        f"reads as {fmt.value}. Every model in the registry is undeployable until "
+        "the matching branch in _format_and_packaging covers this shape."
+    )
+    assert packaging is Packaging.MLFLOW_TAR_GZ
 
 
 # --- auth and transport failure handling --------------------------------------

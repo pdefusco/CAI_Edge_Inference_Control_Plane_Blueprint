@@ -29,6 +29,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 import shutil
 import subprocess
 import time
@@ -536,6 +537,21 @@ def _tags_from_wire(raw: Any) -> dict[str, str]:
     return tags
 
 
+def _repo_type_tokens(metadata: dict[str, Any]) -> set[str]:
+    """Split `model_repo_type` into lowercase alphanumeric tokens.
+
+    Matching on tokens rather than the whole string, because an API that
+    returns `"mlflow"` in one place is apt to return `"MLFLOW_MODEL"` or
+    `"MODEL_REPO_TYPE_MLFLOW"` in another, and exact equality against
+    `"mlflow"` silently answers UNKNOWN for all of them -- which would make
+    every real model undeployable. Tokens rather than a substring test,
+    because `"hf"` inside a longer word is a false positive waiting to happen
+    while `"hf"` as a token is unambiguous.
+    """
+    raw = str(metadata.get("model_repo_type") or "").strip().lower()
+    return {t for t in re.split(r"[^a-z0-9]+", raw) if t}
+
+
 def _format_and_packaging(metadata: dict[str, Any]) -> tuple[ArtifactFormat, Packaging]:
     """MLflow-sourced versions are *presumed* ONNX at the metadata layer only
     -- `MLFlowMetadata` carries no flavor information at all. The real check
@@ -543,23 +559,40 @@ def _format_and_packaging(metadata: dict[str, Any]) -> tuple[ArtifactFormat, Pac
     service at unpack time; this is just the best guess available before any
     bytes have been read.
     """
-    repo_type = str(metadata.get("model_repo_type") or "").strip().lower()
+    tokens = _repo_type_tokens(metadata)
     has_mlflow = "mlflowMetadata" in metadata or "mlflow_metadata" in metadata
     has_hf = "huggingface_metadata" in metadata
     has_ngc = "ngc_metadata" in metadata
 
-    if repo_type == "mlflow" or (has_mlflow and not has_hf and not has_ngc):
+    if "mlflow" in tokens or (has_mlflow and not has_hf and not has_ngc):
         return ArtifactFormat.ONNX, Packaging.MLFLOW_TAR_GZ
-    if repo_type in {"hf", "huggingface", "ngc"} or has_hf or has_ngc:
+    if tokens & {"hf", "huggingface", "ngc"} or has_hf or has_ngc:
         return ArtifactFormat.UNKNOWN, Packaging.RAW_FILE
     # Nothing in the metadata identifies a source -- including the case where
     # `metadata` is absent or `{}` entirely. Deliberately UNKNOWN rather than
     # presuming MLflow: UNKNOWN makes `get_version` refuse with
-    # `UnsupportedFlavor` at the deploy gate, while a wrong ONNX guess would
-    # put bytes into desired state and fail on the device after a download.
-    # If a normally-registered MLflow model turns out to report empty
-    # metadata, this is the line to revisit -- it would make every real model
-    # undeployable, which M3 will catch on the first registration.
+    # `UnsupportedFlavor` at the deploy gate.
+    #
+    # M3 note, and read this before changing it. The original reason for
+    # UNKNOWN was that a wrong ONNX guess "would fail on the device after a
+    # download". That is now only half true: `artifact_service` refuses a
+    # readable MLflow tarball with no `.onnx` member server-side, before any
+    # device fetches anything. What it deliberately does *not* refuse is a
+    # tarball it could not open at all, since that is a transport symptom
+    # rather than a flavor one -- so an optimistic guess here still reaches a
+    # device for a non-tar artifact.
+    #
+    # That leaves two candidate realities and they need opposite fixes, which
+    # is why neither is applied on speculation:
+    #
+    #   * `model_repo_type` is enum-shaped (`"MLFLOW_MODEL"`). Fixed above by
+    #     token matching; this line stays exactly as it is.
+    #   * `metadata` is genuinely `{}` for a normally-registered MLflow
+    #     model. Then this line is what makes every real model undeployable
+    #     and it has to return ONNX/MLFLOW_TAR_GZ.
+    #
+    # `tests/test_cai_registry.py` carries the evidence slot that decides
+    # between them; it stays skipped until an observed payload is dropped in.
     return ArtifactFormat.UNKNOWN, Packaging.RAW_FILE
 
 

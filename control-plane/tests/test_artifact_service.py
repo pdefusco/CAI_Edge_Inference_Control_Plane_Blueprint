@@ -706,6 +706,117 @@ def test_a_missing_file_does_not_raise(tmp_path):
     assert _read_entrypoint(tmp_path / "absent.tar.gz", Packaging.MLFLOW_TAR_GZ) is None
 
 
+# --------------------------------------------------------------------------
+# An MLflow artifact with nothing runnable in it
+# --------------------------------------------------------------------------
+#
+# These three go together, and the reason is that the obvious version of this
+# check is wrong. A *missing MLmodel* is not a failure -- the agent globs for
+# `*.onnx` on purpose (`artifact_manager.py:349-364`) -- so rejecting it would
+# break artifacts that work today. What is fatal is a readable tarball with no
+# `.onnx` member at all, which `_format_and_packaging` produces for real: it
+# labels every MLflow version ONNX from metadata alone, so a sklearn or pyfunc
+# model arrives here claiming to be something it is not.
+
+
+def _tar_gz(members: dict[str, bytes]) -> bytes:
+    """A tarball with exactly the members named, and nothing else."""
+    import io as _io
+    import tarfile as _tarfile
+
+    raw = _io.BytesIO()
+    with _tarfile.open(fileobj=raw, mode="w:gz") as tar:
+        for name, data in members.items():
+            info = _tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, _io.BytesIO(data))
+    return raw.getvalue()
+
+
+def _serving(db, svc_settings, payload: bytes, packaging=Packaging.MLFLOW_TAR_GZ):
+    """An ArtifactService whose registry hands back exactly `payload`."""
+    import io as _io
+
+    class FixedRegistry(FakeModelRegistry):
+        def open_artifact(self, mv):
+            return ArtifactStream(
+                fileobj=_io.BytesIO(payload),
+                packaging=packaging,
+                size_bytes=len(payload),
+                source_uri=mv.artifact_uri,
+            )
+
+    registry = FixedRegistry(payload_size=PAYLOAD)
+    return ArtifactService(db, registry, svc_settings), registry
+
+
+def test_an_mlflow_artifact_with_no_onnx_is_refused(db, svc_settings):
+    """Caught here or not at all usefully.
+
+    Published READY, these bytes travel all the way to the device, which then
+    raises "no .onnx file found" after downloading every one of them -- a
+    server-side fact reported as a device-side error at the most expensive
+    possible moment.
+    """
+    sklearn_flavoured = _tar_gz(
+        {
+            "MLmodel": b"artifact_path: model\nflavors:\n  sklearn:\n    "
+            b"pickled_model: model.pkl\n",
+            "model.pkl": b"not really a pickle, but not an onnx either",
+        }
+    )
+    service, registry = _serving(db, svc_settings, sklearn_flavoured)
+    mv = version(registry)
+
+    with pytest.raises(ArtifactFailed):
+        service.materialize_now(mv)
+
+    row = db.get_artifact(mv.cache_key)
+    assert row.status == "FAILED"
+    assert "UnsupportedFlavor" in row.error
+    # Raised before the os.replace, so nothing was published.
+    assert service.get_ready(mv.cache_key) is None
+
+
+def test_a_missing_mlmodel_is_fine_when_an_onnx_is_there(db, svc_settings, tmp_path):
+    """The regression guard for the check above.
+
+    No MLmodel means no server-side entrypoint hint, which is exactly the case
+    the agent's glob fallback exists for. Rejecting it would be a regression
+    dressed up as hardening.
+    """
+    no_descriptor = _tar_gz({"model.onnx": b"\x08\x09 pretend onnx bytes"})
+    probe = tmp_path / "probe.tar.gz"
+    probe.write_bytes(no_descriptor)
+    assert _read_entrypoint(probe, Packaging.MLFLOW_TAR_GZ) is None  # no hint to read
+
+    service, registry = _serving(db, svc_settings, no_descriptor)
+    mv = version(registry)
+
+    info = service.materialize_now(mv)
+
+    assert info.path.is_file()
+    assert db.get_artifact(mv.cache_key).status == "READY"
+
+
+def test_an_unreadable_archive_is_not_blamed_on_the_flavor(db, svc_settings):
+    """A tarball we cannot open is a transport problem, not a flavor problem.
+
+    This is not hypothetical: httpx decodes `Content-Encoding: gzip`
+    transparently, so a gzip-encoded tarball arrives as a *bare* tar while
+    `Packaging` still says MLFLOW_TAR_GZ (see `registry/cai.py`). Counting zero
+    ONNX members in a tar we never parsed and calling that `UnsupportedFlavor`
+    would send the operator to re-register a model that is perfectly fine.
+    """
+    service, registry = _serving(db, svc_settings, b"this is not a gzip stream")
+    mv = version(registry)
+
+    info = service.materialize_now(mv)  # must not raise UnsupportedFlavor
+
+    assert info.path.is_file()
+    assert db.get_artifact(mv.cache_key).status == "READY"
+
+
 def test_raw_packaging_is_not_parsed(tmp_path):
     """A raw single file has no MLmodel to read, and trying to open one as a
     tarball would log a warning on every materialization for no reason."""

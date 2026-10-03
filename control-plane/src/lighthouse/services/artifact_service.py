@@ -51,6 +51,7 @@ from ..registry import (
     ModelRegistry,
     RegistryError,
     RegistryModelVersion,
+    UnsupportedFlavor,
 )
 from ..util import now_utc
 
@@ -305,7 +306,35 @@ class ArtifactService:
                 raise ArtifactUnavailable(f"registry returned no bytes for {mv.cache_key}")
 
             sha256 = digest.hexdigest()
-            entrypoint = _read_entrypoint(tmp, packaging) or mv.entrypoint
+            layout = _read_mlflow_layout(tmp, packaging)
+            entrypoint = layout.entrypoint or mv.entrypoint
+
+            # An MLflow tarball with no `.onnx` member anywhere can never run at
+            # the edge. Without this the bytes publish READY, a device downloads
+            # all of them, and only then does `_activate` raise "no .onnx file
+            # found" -- a device-side error for a server-side fact, discovered
+            # at the most expensive possible moment. `UnsupportedFlavor` says it
+            # should be "surfaced ... instead of the device discovering it after
+            # a download", and this is the earliest point that holds the bytes.
+            #
+            # It happens for a real reason, not a hypothetical one:
+            # `_format_and_packaging` labels *every* MLflow version ONNX from
+            # metadata alone, so an MLflow model with a sklearn or pyfunc flavor
+            # arrives here claiming to be ONNX. Note this is narrower than a
+            # missing MLmodel, which is fine and stays fine -- the agent globs.
+            #
+            # Raised before `os.replace`, so the except clause's unlink still
+            # removes the partial file rather than leaving it published.
+            if (
+                packaging is Packaging.MLFLOW_TAR_GZ
+                and layout.readable
+                and layout.onnx_members == 0
+            ):
+                raise UnsupportedFlavor(
+                    f"{mv.name} v{mv.version} is an MLflow artifact with no .onnx "
+                    "file in it; nothing in it can run at the edge"
+                )
+
             os.replace(tmp, final)
 
             row = ArtifactCacheRow(
@@ -439,6 +468,66 @@ def _cache_filename(mv: RegistryModelVersion) -> str:
     return f"{safe}.tar.gz"
 
 
+@dataclass(frozen=True, slots=True)
+class _TarLayout:
+    """What one pass over an MLflow tarball tells us.
+
+    Two separate facts that are easy to conflate, and must not be:
+
+      * `entrypoint` is a *hint*. Absent is fine -- the agent globs for
+        `*.onnx` (`artifact_manager.py:349-364`), which is deliberate and
+        documented there as keeping a hand-built artifact working.
+      * `onnx_members == 0` on a readable tar is fatal. Nothing the edge can
+        run is in there, and no fallback will conjure one.
+
+      `readable` keeps those apart from a third case: a tarball we could not
+      open at all. That is a transport problem, not a flavor problem -- see the
+      content-encoding note in `registry/cai.py` -- and calling it
+      `UnsupportedFlavor` would point the operator at the wrong thing.
+    """
+
+    entrypoint: str | None = None
+    onnx_members: int = 0
+    readable: bool = False
+
+
+def _read_mlflow_layout(path: Path, packaging: Packaging) -> _TarLayout:
+    """Read the MLmodel hint and count ONNX members in a single pass.
+
+    One pass because the alternative is decompressing a multi-GB artifact twice
+    to learn two things that are in the same member list.
+    """
+    if packaging is not Packaging.MLFLOW_TAR_GZ:
+        return _TarLayout()
+    try:
+        with tarfile.open(path, mode="r:gz") as tar:
+            members = tar.getmembers()
+            onnx_members = sum(
+                1 for m in members if m.isfile() and m.name.lower().endswith(".onnx")
+            )
+            member = next((m for m in members if Path(m.name).name == "MLmodel"), None)
+            if member is None:
+                return _TarLayout(None, onnx_members, True)
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                return _TarLayout(None, onnx_members, True)
+            doc = yaml.safe_load(io.BytesIO(extracted.read()))
+        if not isinstance(doc, dict):
+            return _TarLayout(None, onnx_members, True)
+        data = doc.get("flavors", {}).get("onnx", {}).get("data")
+        if not isinstance(data, str):
+            return _TarLayout(None, onnx_members, True)
+        # MLmodel paths are relative to the artifact root; keep the prefix the
+        # MLmodel sits under so the agent can resolve it after unpacking.
+        prefix = str(Path(member.name).parent)
+        if prefix not in {"", "."}:
+            return _TarLayout(f"{prefix}/{data}", onnx_members, True)
+        return _TarLayout(data, onnx_members, True)
+    except (tarfile.TarError, yaml.YAMLError, OSError) as exc:
+        log.warning("could not read MLmodel from %s: %s", path, exc)
+        return _TarLayout(None, 0, False)
+
+
 def _read_entrypoint(path: Path, packaging: Packaging) -> str | None:
     """Pull the ONNX file path out of the artifact's MLmodel descriptor.
 
@@ -447,30 +536,4 @@ def _read_entrypoint(path: Path, packaging: Packaging) -> str | None:
     reason to fail an otherwise good artifact, so the agent falls back to its own
     discovery.
     """
-    if packaging is not Packaging.MLFLOW_TAR_GZ:
-        return None
-    try:
-        with tarfile.open(path, mode="r:gz") as tar:
-            member = next(
-                (m for m in tar.getmembers() if Path(m.name).name == "MLmodel"), None
-            )
-            if member is None:
-                return None
-            extracted = tar.extractfile(member)
-            if extracted is None:
-                return None
-            doc = yaml.safe_load(io.BytesIO(extracted.read()))
-        if not isinstance(doc, dict):
-            return None
-        data = doc.get("flavors", {}).get("onnx", {}).get("data")
-        if not isinstance(data, str):
-            return None
-        # MLmodel paths are relative to the artifact root; keep the prefix the
-        # MLmodel sits under so the agent can resolve it after unpacking.
-        prefix = str(Path(member.name).parent)
-        if prefix not in {"", "."}:
-            return f"{prefix}/{data}"
-        return data
-    except (tarfile.TarError, yaml.YAMLError, OSError) as exc:
-        log.warning("could not read MLmodel from %s: %s", path, exc)
-        return None
+    return _read_mlflow_layout(path, packaging).entrypoint

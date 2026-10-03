@@ -372,7 +372,15 @@ def probe_artifact_response(domain, model_id, version, token):
         f"{domain.rstrip('/')}/api/v2/models/{model_id}"
         f"/versions/{version}/artifact"
     )
-    req = urllib.request.Request(url, headers={"Accept": "*/*"})
+    # `Accept-Encoding: identity` asks for the body undecoded. urllib does not
+    # transparently decompress the way httpx does, so this probe is the one
+    # place that can see what the registry actually put on the wire -- and the
+    # difference matters: if the registry serves the tarball with
+    # `Content-Encoding: gzip`, httpx hands the control plane a *bare* tar
+    # while `Packaging` still says tar.gz. The SHA-256 then matches end to end,
+    # so every checksum passes and the only thing that fails is the unpack, on
+    # the device.
+    req = urllib.request.Request(url, headers={"Accept": "*/*", "Accept-Encoding": "identity"})
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     opener = urllib.request.build_opener(_NoRedirect)
@@ -387,9 +395,17 @@ def probe_artifact_response(domain, model_id, version, token):
         return
 
     ctype = (headers.get("Content-Type") or "").strip()
+    cenc = (headers.get("Content-Encoding") or "").strip()
     print(f"  status         = {status}")
     print(f"  Content-Type   = {ctype!r}")
     print(f"  Content-Length = {headers.get('Content-Length')!r}")
+    print(f"  Content-Encoding = {cenc!r}")
+    if cenc and cenc.lower() not in ("identity", ""):
+        print("  [shape] *** the body is content-encoded. httpx decodes this")
+        print("          transparently, so cai.py would cache a decoded body")
+        print("          while Packaging still claims tar.gz -- and the digest")
+        print("          would match end to end, leaving the unpack on the")
+        print("          device as the only thing that fails. Report this line.")
 
     base = ctype.split(";")[0].strip().lower()
     if 300 <= status < 400:
@@ -521,6 +537,37 @@ def probe_api_spec(domain, token):
                     schema = node.get("schema") or {}
                     ref = schema.get("$ref", "").split("/")[-1]
                     print(f"    body {ctype} schema={ref or schema.get('type') or '?'}")
+
+        # The *read* routes' query parameters, which this probe also never
+        # printed. This block is the cheapest thing in M3: the pagination
+        # request parameter name is one of the three open M2 decisions, it is
+        # currently a guess in `cai.py` (`page_token`, degrading to
+        # first-page-only), and it is declared right here in a document the
+        # probe was already fetching and throwing away. Confirming it needs no
+        # registration, no second model and no write of any kind.
+        #
+        # Printed for every GET with query parameters rather than just the
+        # listings, because `page_size` being ignored would matter too and
+        # costs nothing extra to see.
+        print("\n[spec] read routes -- query parameters:")
+        for p in sorted(paths):
+            op = paths[p].get("get")
+            if not op:
+                continue
+            query = [
+                prm for prm in (op.get("parameters") or [])
+                if prm.get("in") == "query"
+            ]
+            if not query:
+                continue
+            print(f"\n  GET {p}")
+            for prm in query:
+                schema = prm.get("schema") or {}
+                typ = prm.get("type") or schema.get("type") or "?"
+                req_mark = "*" if prm.get("required") else " "
+                default = prm.get("default", schema.get("default"))
+                extra = f" default={default!r}" if default is not None else ""
+                print(f"   {req_mark}{prm.get('name')}: {typ}{extra}")
 
         schemas = (body.get("components") or {}).get("schemas") or body.get("definitions") or {}
 

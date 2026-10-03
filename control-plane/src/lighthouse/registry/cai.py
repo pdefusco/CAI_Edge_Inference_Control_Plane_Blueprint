@@ -927,11 +927,28 @@ class CAIModelRegistry:
 
         if not self._logged_artifact_probe:
             self._logged_artifact_probe = True
+            # `content-encoding` is here for a specific failure that is
+            # otherwise close to undiagnosable. httpx decodes a
+            # `Content-Encoding: gzip` body transparently, so if the registry
+            # serves the tarball that way the bytes written to the cache are a
+            # *bare* tar while `Packaging` still says MLFLOW_TAR_GZ. Nothing
+            # upstream notices: the control plane hashes the decoded bytes and
+            # the device receives and verifies those same bytes, so every
+            # checksum in the system agrees. The only thing that fails is
+            # `tarfile.open(..., "r:gz")` -- once in `_read_entrypoint`
+            # server-side, and again on the Jetson in `_activate`.
+            #
+            # This is the one line anybody will read after the first real
+            # registration, so the header that distinguishes that case from a
+            # healthy response belongs in it.
             log.info(
-                "artifact response: status=%s content-type=%r content-length=%r",
+                "artifact response: status=%s content-type=%r content-length=%r "
+                "content-encoding=%r transfer-encoding=%r",
                 status,
                 response.headers.get("content-type"),
                 response.headers.get("content-length"),
+                response.headers.get("content-encoding"),
+                response.headers.get("transfer-encoding"),
             )
 
         if 300 <= status < 400:

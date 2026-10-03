@@ -42,6 +42,7 @@ installed; this module does not need it either, see its own docstring).
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import subprocess
@@ -641,6 +642,65 @@ def test_an_octet_stream_artifact_is_streamed_straight_through():
         data = b"".join(stream.chunks())
 
     assert data == raw_bytes
+
+
+def test_the_one_artifact_probe_log_names_the_body_encoding(caplog):
+    """The artifact probe logs once per process, and that single line is what
+    anybody will read after the first real registration. It has to carry
+    `content-encoding`, because the failure it distinguishes is otherwise
+    close to undiagnosable.
+
+    httpx decodes a `Content-Encoding: gzip` body transparently. If the
+    registry serves the tarball that way, the bytes reaching the cache are a
+    *bare* tar while `Packaging` still says MLFLOW_TAR_GZ -- and nothing
+    upstream notices, because the control plane hashes the decoded bytes and
+    the device verifies those same bytes, so every checksum in the system
+    agrees. The only thing that fails is `tarfile.open(..., "r:gz")`: once
+    server-side in `_read_entrypoint`, and again on the Jetson in `_activate`,
+    after a full download over a home uplink.
+
+    Asserted on the emitted record rather than on the headers dict, since the
+    whole value of the line is that it is *in the log* for an operator to
+    paste back.
+    """
+    inner_tar = b"what-the-device-needs-to-see-as-a-gzip-tar"
+    handler = _route(
+        {
+            ("GET", f"{PREFIX}/models/model-1/versions/2/artifact"): httpx.Response(
+                200,
+                content=gzip.compress(inner_tar),
+                headers={
+                    "content-type": "application/x-tar",
+                    "content-encoding": "gzip",
+                },
+            )
+        }
+    )
+    client, _ = _client_for(_settings(), handler)
+    registry = CAIModelRegistry(_settings(), client)
+    mv = RegistryModelVersion(
+        name="fashion-cnn",
+        version="2",
+        model_id="model-1",
+        version_uuid="2-1704067200",
+        artifact_uri="s3a://bucket/fashion-cnn/2",
+    )
+
+    with caplog.at_level(logging.INFO):
+        with registry.open_artifact(mv) as stream:
+            data = b"".join(stream.chunks())
+
+    probe_lines = [r.getMessage() for r in caplog.records if "artifact response" in r.getMessage()]
+    assert probe_lines, "the one-shot artifact probe line was not logged at INFO"
+    assert "content-encoding='gzip'" in probe_lines[0]
+
+    # The defect itself, asserted rather than described: what came out of the
+    # stream is the *decoded* tar, not the gzip the registry sent. Writing this
+    # to the cache leaves a file that `tarfile.open(..., "r:gz")` cannot read
+    # while every digest still agrees -- which is why the header above has to
+    # be in the log.
+    assert data == inner_tar
+    assert data[:2] != b"\x1f\x8b"
 
 
 # --- auth-chain subprocess boundary --------------------------------------------

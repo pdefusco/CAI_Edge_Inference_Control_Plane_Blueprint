@@ -83,6 +83,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import Any
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -233,8 +234,13 @@ def discover_mechanism() -> dict:
 # --------------------------------------------------------------------------
 
 
-def log_to_mlflow(model_name: str, experiment: str) -> tuple[str, str]:
-    """Log the graph as an MLflow run artifact. Returns (run_id, artifact_path).
+def log_to_mlflow(model_name: str, experiment: str) -> tuple[str, str, str]:
+    """Log the graph as an MLflow run artifact.
+
+    Returns `(run_id, artifact_path, experiment_id)`. The experiment id is
+    returned because `cmlapi.CreateRegisteredModelRequest` asks for it
+    alongside the run id -- confirmed from the generated client's
+    `attribute_map`, not assumed.
 
     `pip_requirements` is passed explicitly so MLflow does not call
     `get_default_pip_requirements()`, which imports onnxruntime and can fail a
@@ -251,6 +257,7 @@ def log_to_mlflow(model_name: str, experiment: str) -> tuple[str, str]:
     mlflow.set_experiment(experiment)
     with mlflow.start_run() as run:
         run_id = run.info.run_id
+        experiment_id = str(run.info.experiment_id)
         kwargs = dict(
             onnx_model=model_proto,
             pip_requirements=["onnx"],
@@ -265,11 +272,49 @@ def log_to_mlflow(model_name: str, experiment: str) -> tuple[str, str]:
         mlflow.log_param("opset", OPSET)
         mlflow.log_param("input_shape", str(list(INPUT_SHAPE)))
         mlflow.log_param("output_shape", str(list(OUTPUT_SHAPE)))
-    print(f"  logged run {run_id} with artifact_path 'model'")
-    return run_id, "model"
+    print(f"  logged run {run_id} (experiment {experiment_id}) with artifact_path 'model'")
+    return run_id, "model", experiment_id
 
 
-def register(mechanism: str, model_name: str, run_id: str, artifact_path: str) -> str | None:
+PROJECT_ID_ENVS = ("CDSW_PROJECT_ID", "CML_PROJECT_ID")
+
+
+def resolve_project_id(explicit: str | None) -> str:
+    """Find the Session's own project id, for `CreateRegisteredModelRequest`.
+
+    Not a tenant secret the way a hostname is, but still read from the
+    environment rather than guessed, and never defaulted: registering into the
+    wrong project would put a version somewhere the operator did not ask for.
+    On failure this lists the *names* of the Session's CDSW/CML variables --
+    names only, because their values are this workbench's business.
+    """
+    if explicit:
+        return explicit
+    for var in PROJECT_ID_ENVS:
+        val = os.environ.get(var)
+        if val:
+            print(f"  project_id from ${var}")
+            return val.strip()
+    candidates = sorted(
+        k for k in os.environ if k.startswith(("CDSW_", "CML_")) and "PROJECT" in k
+    )
+    sys.exit(
+        "cmlapi needs a project_id and none of "
+        f"{', '.join('$' + v for v in PROJECT_ID_ENVS)} is set.\n"
+        f"  project-ish variables present here: {candidates or ['<none>']}\n"
+        "  Pass --project-id, or use --mechanism mlflow."
+    )
+
+
+def register(
+    mechanism: str,
+    model_name: str,
+    run_id: str,
+    artifact_path: str,
+    *,
+    experiment_id: str = "",
+    project_id: str = "",
+) -> str | None:
     """Promote the logged run artifact into the AI Registry.
 
     Returns the registry's version label if it reported one. Both paths print
@@ -296,14 +341,48 @@ def register(mechanism: str, model_name: str, run_id: str, artifact_path: str) -
             "Re-run with --dry-run and paste the method list: the call has to be\n"
             "written against this workbench's real signature, not a guess."
         )
+    # Field names come from `CreateRegisteredModelRequest.attribute_map` as
+    # read off a real workbench (cmlapi, mlflow 3.16):
+    #   project_id, experiment_id, run_id, model_path, model_name, tags,
+    #   description, notes, visibility
+    # Note `model_name`, not `name` -- an earlier version of this script
+    # guessed `name` and would have been rejected or silently dropped.
     body = {
-        "name": model_name,
+        "project_id": project_id,
+        "experiment_id": experiment_id,
         "run_id": run_id,
         "model_path": artifact_path,
+        "model_name": model_name,
         "visibility": "private",
     }
+    # Build the typed request when the class is there, so the generated
+    # client validates the field names instead of posting a dict the server
+    # may quietly ignore.
+    req_cls = getattr(cmlapi, "CreateRegisteredModelRequest", None)
+    payload: Any = body
+    if req_cls is not None:
+        try:
+            payload = req_cls(**body)
+        except TypeError as exc:
+            sys.exit(
+                f"CreateRegisteredModelRequest rejected these fields: {exc}\n"
+                "  This workbench's cmlapi differs from the one this body was\n"
+                "  written against. Re-run the inspect snippet in the module\n"
+                "  docstring and paste the attribute_map, or use\n"
+                "  --mechanism mlflow."
+            )
     print(f"  cmlapi create_registered_model({redact(body)})")
-    result = fn(body)
+    result = fn(payload)
+    # `RegisteredModel.model_versions` is a list; the version number lives on
+    # `RegisteredModelVersion.number`. Both shapes are tried because this is
+    # the one return value that has not been observed yet.
+    versions = getattr(result, "model_versions", None) or []
+    if versions:
+        first = versions[0]
+        for attr in ("number", "version_name", "model_version_id"):
+            val = getattr(first, attr, None)
+            if val:
+                return str(val)
     version = getattr(result, "model_version", None)
     return str(getattr(version, "version", "") or "") or None
 
@@ -419,6 +498,11 @@ def parse_args(argv=None):
         "a hostname is a tenant identifier and this repo is public",
     )
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
+    parser.add_argument(
+        "--project-id",
+        help="project for the cmlapi registration; else $CDSW_PROJECT_ID / "
+        "$CML_PROJECT_ID. Never defaulted",
+    )
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument(
         "--mechanism",
@@ -547,10 +631,20 @@ def main(argv=None) -> int:
         return 0
 
     print("\n=== logging to MLflow ===")
-    run_id, artifact_path = log_to_mlflow(args.model_name, args.experiment)
+    run_id, artifact_path, experiment_id = log_to_mlflow(args.model_name, args.experiment)
 
     print("\n=== registering ===")
-    version = register(found["mechanism"], args.model_name, run_id, artifact_path)
+    project_id = (
+        resolve_project_id(args.project_id) if found["mechanism"] == "cmlapi" else ""
+    )
+    version = register(
+        found["mechanism"],
+        args.model_name,
+        run_id,
+        artifact_path,
+        experiment_id=experiment_id,
+        project_id=project_id,
+    )
     print(f"  registry reported version {version!r}")
 
     print("\n=== reading it back over REST, as the control plane will ===")

@@ -7,8 +7,12 @@ exact wire shapes `registry/cai.py` has to parse:
 
   * `GET /api/v2/models`            -> names + `model_id` lineage
   * `GET .../versions`              -> version labels, status, flavors
+  * `GET .../artifact`              -> status, Content-Type, gzip magic, and on a
+                                       3xx the redirect *host* -- never followed
   * the real `artifact_uri`         -> the prefix shape to parse and resolve
   * what objects actually exist at that prefix (the thing docs don't tell us)
+  * the served API spec, including every write route's **request** body, which
+    is what a registration has to be written against
 
 Auth follows the documented CAI chain, not guesswork. The registry sits behind
 CDP's external-authz gateway (`/gateway/cdpauth/auth/api/v1/extauthz/...`), which
@@ -32,7 +36,8 @@ Usage, in a CAI Session terminal (needs `pip install cdpcli` and `cdp configure
 set` with your workload user access keys):
 
     python probe_registry.py --environment my-cdp-env
-    python probe_registry.py --environment my-cdp-env --model fashion-cnn
+    python probe_registry.py --environment my-cdp-env --model smoke-test
+    python probe_registry.py --environment my-cdp-env --spec-only
     python probe_registry.py --domain https://... --token-env SOME_VAR
 
 Two rules this script keeps:
@@ -58,6 +63,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DOMAIN_ENV = "LIGHTHOUSE_REGISTRY_DOMAIN"
@@ -304,6 +310,122 @@ def probe_artifact_location(uri):
         print("  (truncated)")
 
 
+# -- the artifact response ---------------------------------------------------
+
+
+def _first_version(payload):
+    """Pull one concrete version label out of whatever the versions call returned.
+
+    `model_versions` is what the spec declares -- versions arrive nested on
+    `GET /models/{id}` and there is no list route -- but the alternatives cost
+    nothing, and this script exists precisely because a declaration can be wrong.
+    """
+    entries = payload if isinstance(payload, list) else None
+    if isinstance(payload, dict):
+        for key in ("model_versions", "versions", "items"):
+            val = payload.get(key)
+            if isinstance(val, list) and val:
+                entries = val
+                break
+        else:
+            inner = payload.get("model")
+            if isinstance(inner, dict):
+                return _first_version(inner)
+    if not entries:
+        return None
+    first = entries[0]
+    if isinstance(first, dict):
+        for key in ("version", "model_version", "version_number"):
+            if first.get(key) is not None:
+                return str(first[key])
+    return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn a 3xx into an HTTPError instead of transparently following it.
+
+    urllib follows redirects by default, and here that would be actively
+    harmful: the redirect target is an object store, and following it would
+    carry the workload JWT there. `registry/cai.py` follows it on a *separate*
+    request with no Authorization header for exactly that reason.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def probe_artifact_response(domain, model_id, version, token):
+    """Report the *shape* of the artifact response, without downloading it.
+
+    This is the largest of the three shapes `registry/cai.py` had to guess at.
+    `open_artifact` branches at runtime on the observed status and Content-Type
+    -- 200 octet-stream/gzip/tar, 200 multipart, a 3xx to object storage, 400
+    for an HF/NGC version -- because the spec declares
+    `produces: multipart/form-data`, which is very likely a mislabel for a
+    binary download. One real response settles which branch is live.
+
+    Only the first couple of KB are read: enough for the gzip magic number and
+    a multipart boundary, nowhere near the whole artifact.
+    """
+    print("\n=== GET .../artifact -- response shape only ===")
+    url = (
+        f"{domain.rstrip('/')}/api/v2/models/{model_id}"
+        f"/versions/{version}/artifact"
+    )
+    req = urllib.request.Request(url, headers={"Accept": "*/*"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=30) as resp:
+            status, headers, head = resp.status, resp.headers, resp.read(2048)
+    except urllib.error.HTTPError as exc:
+        # Both a real error and -- thanks to _NoRedirect -- every 3xx land here.
+        status, headers, head = exc.code, exc.headers, exc.read(2048)
+    except Exception as exc:  # network-level
+        print(f"  request failed: {type(exc).__name__}: {exc}")
+        return
+
+    ctype = (headers.get("Content-Type") or "").strip()
+    print(f"  status         = {status}")
+    print(f"  Content-Type   = {ctype!r}")
+    print(f"  Content-Length = {headers.get('Content-Length')!r}")
+
+    base = ctype.split(";")[0].strip().lower()
+    if 300 <= status < 400:
+        # The host, never the URL: a pre-signed URL's query string is a
+        # credential, and `redact()` would blank it anyway.
+        host = urllib.parse.urlsplit(headers.get("Location") or "").netloc
+        print(f"  Location host  = {host or '<none>'}")
+        print("  [shape] the registry redirects to object storage. cai.py")
+        print("          follows this on a second request carrying no")
+        print("          Authorization header. If that leg 403s, the control")
+        print("          plane needs its own object-store identity -- the one")
+        print("          finding that would pull boto3 into the design.")
+    elif status == 400:
+        print("  [shape] 400 is the spec's HF/NGC case: no brokered bytes for a")
+        print("          version the edge could not run anyway. cai.py already")
+        print("          maps this to UnsupportedFlavor.")
+    elif status in (401, 403):
+        print("  [shape] the artifact route rejected the same token the listing")
+        print("          accepted -- report this, it changes the byte path.")
+    elif 200 <= status < 300:
+        if base.startswith("multipart/"):
+            print("  [shape] multipart, so the spec's `produces` was literal and")
+            print("          cai.py's multipart branch is the live one.")
+        elif base in ("application/octet-stream", "application/gzip", "application/x-tar"):
+            print("  [shape] a plain binary body -- cai.py streams it through.")
+        else:
+            print(f"  [shape] unexpected content-type {base!r}; cai.py falls back")
+            print("          to streaming it as raw bytes and warns.")
+        if head[:2] == b"\x1f\x8b":
+            print("  [shape] body starts with the gzip magic (1f 8b), which is")
+            print("          what Packaging.MLFLOW_TAR_GZ assumes.")
+        else:
+            print(f"  [shape] body does NOT start with gzip magic: {head[:8]!r}")
+            print("          -> Packaging.MLFLOW_TAR_GZ would be wrong.")
+
+
 def probe_api_spec(domain, token):
     """Ask the registry to describe itself.
 
@@ -375,6 +497,31 @@ def probe_api_spec(domain, token):
                 for prm in (spec_get.get("parameters") or []):
                     print(f"  param: {prm.get('name')} in={prm.get('in')}")
 
+        # The *request* contracts, which this probe never printed -- it only ever
+        # showed responses. M3 has to create a model and a version, so which body
+        # each write route wants is the thing that has to be known before any
+        # registration code is written. Handles both Swagger 2.0 (a `body`
+        # parameter carrying `schema.$ref`) and OpenAPI 3 (`requestBody`).
+        print("\n[spec] write routes -- request contracts:")
+        for p in sorted(paths):
+            for verb in ("post", "put", "patch"):
+                op = paths[p].get(verb)
+                if not op:
+                    continue
+                print(f"\n  {verb.upper()} {p}")
+                for prm in (op.get("parameters") or []):
+                    ref = (prm.get("schema") or {}).get("$ref", "").split("/")[-1]
+                    where = prm.get("in")
+                    req_mark = "*" if prm.get("required") else " "
+                    print(
+                        f"   {req_mark}param {prm.get('name')} in={where}"
+                        + (f" schema={ref}" if ref else "")
+                    )
+                for ctype, node in ((op.get("requestBody") or {}).get("content") or {}).items():
+                    schema = node.get("schema") or {}
+                    ref = schema.get("$ref", "").split("/")[-1]
+                    print(f"    body {ctype} schema={ref or schema.get('type') or '?'}")
+
         schemas = (body.get("components") or {}).get("schemas") or body.get("definitions") or {}
 
         def fmt(meta):
@@ -420,6 +567,8 @@ def main():
     ap.add_argument("--domain", default=os.environ.get(DOMAIN_ENV),
                     help=f"registry base URL; else ${DOMAIN_ENV}, else --environment")
     ap.add_argument("--model", default=None, help="focus a single model name")
+    ap.add_argument("--spec-only", action="store_true",
+                    help="dump the served API spec and stop (no model reads)")
     ap.add_argument("--workload-name", default="DE", choices=("DE", "DF", "OPDB"),
                     help="workload name for the UMS token mint (any mints the same JWT)")
     src = ap.add_mutually_exclusive_group()
@@ -456,6 +605,16 @@ def main():
         print("\nAuth did not succeed, so the shapes below will be empty.")
         print("The status code above is itself the finding -- report it.")
 
+    # The spec dump runs whether or not the registry has models. It used to live
+    # inside the empty-registry branch below, as the consolation prize for having
+    # nothing to read shapes off -- which meant it silently stopped happening the
+    # moment the first model was registered, i.e. exactly when the write-route
+    # request schemas are wanted.
+    found_spec = probe_api_spec(domain, token)
+    if args.spec_only:
+        print("\n--spec-only: stopping before any model reads.")
+        return
+
     status, models = get_json(f"{domain}/api/v2/models", token)
     print(f"\n=== GET /api/v2/models -> {status} ===")
     show("models (redacted)", models)
@@ -485,9 +644,6 @@ def main():
         entries = models
 
     if not entries:
-        # No data to read shapes off, so ask the service to describe itself.
-        # This is why an empty registry is not the end of the probe.
-        found_spec = probe_api_spec(domain, token)
         print("\n" + "=" * 72)
         if found_spec:
             print("Registry is empty, but its API spec is above -- that is enough")
@@ -544,6 +700,16 @@ def main():
             else:
                 print("\n[shape] no object-store URI in the versions payload --")
                 print("  the adapter may need a separate artifact-resolution call.")
+
+            # The artifact route is the one shape the adapter had to guess at
+            # outright, and it needs a concrete version to ask about.
+            version = _first_version(versions)
+            if version is None:
+                print("\n[shape] no version label found in the payload above, so")
+                print("        the artifact route cannot be probed. Paste the")
+                print("        block and the adapter's guess stands for now.")
+            else:
+                probe_artifact_response(domain, model_id, version, token)
             break
     else:
         print("\nNone of the version paths returned 2xx; paste the codes above.")

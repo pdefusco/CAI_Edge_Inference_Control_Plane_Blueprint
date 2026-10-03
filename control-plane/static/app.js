@@ -83,7 +83,12 @@ async function api(path, options = {}) {
     let detail = response.statusText;
     try {
       const body = await response.json();
-      detail = body.detail || body.message || detail;
+      // `message` is the ErrorResponse envelope the API now always serves.
+      // `detail` is only a fallback for a body from outside the app's own
+      // handlers, and must be a string: in the envelope it holds an object,
+      // which would render as "[object Object]" in the control-error banner.
+      if (typeof body.message === "string") detail = body.message;
+      else if (typeof body.detail === "string") detail = body.detail;
     } catch (_) {
       /* non-JSON error body; the status text will have to do */
     }

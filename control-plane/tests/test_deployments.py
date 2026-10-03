@@ -141,7 +141,9 @@ def test_a_version_with_no_onnx_flavor_is_409(app, admin, device):
     response = admin.put(f"/api/v1/devices/{DEVICE_ID}/deployment", json=deployment("3"))
 
     assert response.status_code == 409
-    assert "onnx" in response.json()["detail"].lower()
+    body = response.json()
+    assert body["code"] == "UnsupportedFlavor"
+    assert "onnx" in body["message"].lower()
 
 
 def test_an_unreachable_registry_is_503_with_a_backoff(app, admin, device):

@@ -15,13 +15,18 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from lighthouse_contracts import ErrorResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .api import artifacts, devices, meta, models
 from .api.deps import AppContext, build_context
+from .api.errors import code_for_status, error_body, registry_error_body
 from .config import ConfigError, Settings, load_settings
 from .registry import RegistryError
 from .repositories import Store
@@ -141,6 +146,13 @@ def create_app(
             "reports actual state."
         ),
         lifespan=lifespan,
+        # Declared once for every route rather than per-route: the handlers
+        # below guarantee it globally, so documenting it per-route would be 27
+        # chances to forget one.
+        responses={
+            "4XX": {"model": ErrorResponse, "description": "Error"},
+            "5XX": {"model": ErrorResponse, "description": "Error"},
+        },
     )
     app.state.ctx = context
 
@@ -160,24 +172,64 @@ def create_app(
             allow_headers=["*"],
         )
 
+    # -- one error shape, whichever path the error took --------------------
+    #
+    # These four handlers exist so that `ErrorResponse` is what a client
+    # actually receives. The two interesting ones are the last two: FastAPI's
+    # own defaults for `HTTPException` and request validation serve
+    # `{"detail": ...}`, so without them every `raise HTTPException(...)` in
+    # the route layer -- which is most of the error surface -- would keep
+    # emitting a second shape alongside this one. Overriding the defaults is
+    # what lets the ~27 existing raise sites stay exactly as they are.
+
     @app.exception_handler(ServiceError)
     async def _service_error(request: Request, exc: ServiceError) -> JSONResponse:
         """Backstop. Routes translate these explicitly; this keeps a missed one
         from surfacing as an opaque 500."""
         log.warning("unmapped service error on %s: %s", request.url.path, exc)
         return JSONResponse(
-            status_code=409, content={"code": type(exc).__name__, "message": str(exc)}
+            status_code=409, content=error_body(type(exc).__name__, str(exc))
         )
 
     @app.exception_handler(RegistryError)
     async def _registry_error(request: Request, exc: RegistryError) -> JSONResponse:
-        from .api.errors import registry_http_error
+        status_code, body, headers = registry_error_body(exc)
+        return JSONResponse(status_code=status_code, content=body, headers=headers)
 
-        mapped = registry_http_error(exc)
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        """Re-envelope FastAPI's `{"detail": ...}`.
+
+        A route that already knows its code may raise with a dict detail; the
+        rest hand us prose and get a status-derived code. `headers` is carried
+        through because `WWW-Authenticate` on a 401 and `Retry-After` on a 503
+        are load-bearing -- dropping them would break the agent's backoff and
+        the dashboard's sign-in gate.
+        """
+        detail = exc.detail
+        if isinstance(detail, dict) and "code" in detail and "message" in detail:
+            body = error_body(
+                str(detail["code"]), str(detail["message"]), detail.get("detail")
+            )
+        else:
+            body = error_body(code_for_status(exc.status_code), str(detail))
+        return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """422s carry a list, which the envelope's `detail` cannot hold, so the
+        per-field errors go under a key. They are kept rather than summarized:
+        for a contract this strict, which field was rejected is the whole
+        message."""
         return JSONResponse(
-            status_code=mapped.status_code,
-            content={"code": type(exc).__name__, "message": str(mapped.detail)},
-            headers=mapped.headers,
+            status_code=422,
+            content=error_body(
+                code_for_status(422),
+                "request does not match the API contract",
+                {"errors": jsonable_encoder(exc.errors())},
+            ),
         )
 
     _mount_dashboard(app, context)

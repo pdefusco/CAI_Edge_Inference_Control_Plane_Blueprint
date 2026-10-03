@@ -209,6 +209,25 @@ def _load_registry(settings: Settings) -> None:
             "to name the file holding the workload JWT."
         )
 
+    # Naming the source is not the same as the source having anything in it, and
+    # both providers read lazily -- so without these two checks the control plane
+    # boots clean on a credential that cannot work and only admits it on the
+    # first request, as a 502 on /models. Checked here for the same reason
+    # LIGHTHOUSE_REGISTRY_CA_BUNDLE is checked below: startup is the last moment
+    # an operator is still watching.
+    if settings.registry_token_source == "env":
+        if not (os.environ.get(settings.registry_token_env or "") or "").strip():
+            raise ConfigError(
+                f"LIGHTHOUSE_REGISTRY_TOKEN_ENV names {settings.registry_token_env!r}, "
+                "but that variable is empty or unset. It must hold the workload JWT."
+            )
+    if settings.registry_token_source == "file":
+        token_path = settings.registry_token_file
+        if token_path is not None and not token_path.is_file():
+            raise ConfigError(
+                f"LIGHTHOUSE_REGISTRY_TOKEN_FILE does not exist: {token_path}"
+            )
+
     # The flag names a workload type, not the service being called -- any of the
     # three mints the same general-purpose UMS JWT, and there is no "ML" value.
     # Rejecting anything else here saves a confusing 401 later.

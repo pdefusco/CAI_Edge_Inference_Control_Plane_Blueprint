@@ -49,6 +49,13 @@ class RedactingFilter(logging.Filter):
         re.compile(r"(lha_)[A-Za-z0-9_\-]{8,}"),
         re.compile(r"(?i)(authorization|x-lighthouse-admin-token|cookie)([=:]\s*)\S+"),
         re.compile(r"(?i)(x-amz-signature=)[0-9a-f]+"),
+        # A bare UMS workload JWT. The patterns above only catch a token that
+        # arrives labelled -- in an `Authorization:` header or as our own
+        # `lhd_`/`lha_` shape -- but the registry adapter's token is a raw
+        # three-segment JWT that can reach a log through a traceback or a
+        # repr with no header around it. `eyJ` is the base64 of `{"`, so every
+        # JWT header segment starts with it.
+        re.compile(r"(eyJ)[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+"),
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -210,18 +217,25 @@ def run() -> None:
     """Console-script entry point (`lighthouse`)."""
     import uvicorn
 
+    # `create_app` is inside the handler on purpose. It builds the service graph
+    # eagerly -- including the registry, whose construction resolves a domain and
+    # a credential and so can raise ConfigError long after `load_settings()`
+    # returned cleanly. Building it outside meant a missing `cai` extra, an
+    # unnamed registry domain or a rejected token exited on a raw traceback,
+    # throwing away the actionable message config.py had already written.
     try:
         settings = load_settings()
+        configure_logging(settings)
+        app = create_app(settings)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    configure_logging(settings)
     # CDSW_APP_PORT is what CAI routes the Application's public URL to. Binding
     # anything else produces an app that starts cleanly and is unreachable.
     port = int(os.environ.get("CDSW_APP_PORT") or os.environ.get("PORT") or 8000)
     host = os.environ.get("LIGHTHOUSE_HOST", "127.0.0.1" if settings.env == "local" else "0.0.0.0")
-    uvicorn.run(create_app(settings), host=host, port=port, log_config=None)
+    uvicorn.run(app, host=host, port=port, log_config=None)
 
 
 if __name__ == "__main__":  # pragma: no cover

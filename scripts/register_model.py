@@ -421,6 +421,14 @@ def parse_args(argv=None):
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument(
+        "--mechanism",
+        default="auto",
+        choices=("auto", "cmlapi", "mlflow"),
+        help="override the preflight's choice. `auto` prefers cmlapi when it "
+        "exposes registry methods; pass `mlflow` to force the documented "
+        "MLflow path if the cmlapi call signature does not match",
+    )
+    parser.add_argument(
         "--wait-seconds", type=int, default=300, help="budget for reaching READY"
     )
     parser.add_argument(
@@ -447,6 +455,16 @@ def main(argv=None) -> int:
     args = parse_args(argv)
 
     found = discover_mechanism()
+    if args.mechanism != "auto":
+        # The operator overrides the preference order. Still report what the
+        # preflight would have picked, so the transcript records the override
+        # rather than hiding it.
+        if found["mechanism"] != args.mechanism:
+            print(
+                f"  -> overridden: using {args.mechanism!r} "
+                f"(preflight preferred {found['mechanism'] or 'NONE'})"
+            )
+        found["mechanism"] = args.mechanism
     if found["onnx"] is None:
         print("\nonnx is required to build the graph:\n    pip install onnx", file=sys.stderr)
         return 2

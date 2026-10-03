@@ -11,7 +11,21 @@ The registry's DNS resolves to a private address with `endpointPublicAccess:
 false`. There is no route to it from a laptop, VPN or not. Everything here that
 touches the registry has to run from a Session inside the workbench.
 
-    pip install onnx mlflow cdpcli        # none of these is a repo dependency
+    pip install onnx 'mlflow<3' cdpcli    # none of these is a repo dependency
+
+`mlflow<3` is a hard pin, not caution. CAI's bundled tracking server
+(`/opt/cmladdons/python/site-packages/tracking_server/`) replaces MLflow's
+store and constructs `RunInfo(run_uuid=...)`. MLflow 3 removed that keyword,
+so an unpinned `pip install mlflow` installs 3.x into `~/.local`, shadows the
+working client, and `mlflow.start_run()` dies with
+
+    TypeError: RunInfo.__init__() got an unexpected keyword argument 'run_uuid'
+
+which reads like a bug in this script and is not one -- nothing client-side
+can paper over a store that speaks the old constructor. Observed on a real
+workbench with mlflow 3.16.1. If you already have 3.x:
+
+    pip install --force-reinstall 'mlflow<3'
     python scripts/register_model.py --environment <YOUR-ENV> --dry-run
     python scripts/register_model.py --environment <YOUR-ENV>
 
@@ -77,6 +91,7 @@ them before the output leaves a private channel, and never commit them.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -218,6 +233,31 @@ def discover_mechanism() -> dict:
             )
         except Exception as exc:
             print(f"  mlflow URIs unreadable: {type(exc).__name__}")
+
+    # The bundled-store conflict, detected as the conjunction it actually is
+    # rather than by version number alone. CAI replaces MLflow's tracking
+    # store with `/opt/cmladdons/.../tracking_server`, which builds
+    # `RunInfo(run_uuid=...)`; MLflow 3 removed that keyword. Either half
+    # alone is fine -- MLflow 3 against a normal store, or the bundled store
+    # against MLflow 2 -- so neither version nor store is reported as a
+    # problem on its own. `find_spec` rather than an import: this is a
+    # read-only preflight and the module has already been loaded once by
+    # MLflow in the failing case.
+    found["store_conflict"] = False
+    if mlflow_mod is not None:
+        bundled = importlib.util.find_spec("tracking_server") is not None
+        try:
+            major = int(str(found["mlflow"] or "0").split(".")[0])
+        except ValueError:
+            major = 0
+        found["store_conflict"] = bundled and major >= 3
+        if found["store_conflict"]:
+            print(
+                f"\n  !! mlflow {found['mlflow']} with CAI's bundled tracking store.\n"
+                "     `mlflow.start_run()` will raise TypeError on 'run_uuid';\n"
+                "     nothing client-side can work around it. Remedy:\n"
+                "         pip install --force-reinstall 'mlflow<3'"
+            )
 
     if found["cmlapi_methods"]:
         found["mechanism"] = "cmlapi"
@@ -562,6 +602,19 @@ def main(argv=None) -> int:
     )
     if found["mechanism"] is None and not args.dry_run:
         print(f"\n{no_mechanism}", file=sys.stderr)
+        return 2
+
+    # Fatal for *both* mechanisms, not just --mechanism mlflow: the cmlapi
+    # path registers an MLflow run, so `log_to_mlflow` runs either way and
+    # the store conflict stops it before anything reaches the registry.
+    if found["store_conflict"] and not args.dry_run:
+        print(
+            "\nrefusing to run: mlflow 3.x cannot create a run against CAI's\n"
+            "bundled tracking store, and every path here logs a run first.\n"
+            "    pip install --force-reinstall 'mlflow<3'\n"
+            "then re-run. Nothing was written.",
+            file=sys.stderr,
+        )
         return 2
 
     # Build first. It needs no credential and no network, so a broken graph

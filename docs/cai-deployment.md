@@ -247,6 +247,28 @@ assume it.** That 8090 was free and bindable is observed. That the public URL
 routes to 8090 is not, and the sibling provenance is exactly the reason to doubt
 it. §6's probe is that check, and it is the first thing to run.
 
+Also observed 2026-10-04, and it is evidence *against* 8090: the sibling was a
+**Session**. A CAI shell prompt is `cdsw@<workload-id>`, and the id in the
+prompt of an open Session matched the id embedded in the
+`DS_RUNTIME_<id>_SERVICE_PORT_APP` that supplied 8090. So the Application is
+serving on a port that Kubernetes allocated to something else, and it bound only
+because no service in this container claims 8090. The port CAI probably routes
+the Application's subdomain to is the one its own `CDSW_APP_PORT` names — 8100 —
+which is precisely the port the engine holds as pid 1. Keep the candidate
+anyway: binding *something* turns an exit-3 crash into a running process that can
+be probed, and the probe is what settles it.
+
+**The test, in order, because the first answer masks the second.** With
+authentication enabled, the ingress answers with a 302 to the workbench login
+before anything reaches the Application (§6), so a 302 says nothing about the
+port. Disable authentication first, then curl `/api/v1/health` again and read the
+result this way:
+
+| Result | Meaning |
+| --- | --- |
+| The health JSON | The subdomain routes to 8090. Nothing more to fix; run §6's probe. |
+| 502/503/504, or a CAI error page | The subdomain routes somewhere our process is not — almost certainly 8100. The fix is at creation time, below. |
+
 **If the public URL does not reach it, the port variables are overridden.**
 Three `CDSW_*` port variables collapsed onto one value is the signature. Look in
 both places an Application inherits from — the Application's own environment
@@ -257,6 +279,20 @@ ports. Note that `PORT` cannot repair this from the UI: `main.py:302` reads
 `CDSW_APP_PORT` first, so a hand-set `PORT=8090` loses to a hand-set
 `CDSW_APP_PORT=8100`. Setting `CDSW_APP_PORT=8090` directly does work, and is
 the one-variable way to test the mapping without a deploy.
+
+**The other creation-time candidate is the runtime's editor, and it explains
+more of the evidence.** Every surprise in §3 — no `__file__`, a live event loop,
+the engine holding `CDSW_APP_PORT` as pid 1 with a `jupyter-wsg-launcher`
+command line — is a consequence of the script being run by a notebook kernel
+rather than as a process. A runtime whose editor is *not* kernel-backed should
+define `__file__`, start no loop, and leave `CDSW_APP_PORT` free, which would
+make all three workarounds in `app.py` inert rather than necessary. **Open
+question. Measure it; do not assume it.** The kernel behaviour is observed
+(2026-10-04, three separate failures). That a different editor avoids it is
+inference from how the failures line up, not a measurement — and it is cheap to
+test: create a second Application on a non-kernel runtime, same script, and read
+the first lines of its log. If this docstring is echoed as cell output, it is
+still a kernel.
 
 `app.py` prints what all of this needs, on the failure path only: the holder's
 pid and command line, every `*PORT*` variable whose value is a bare number, and
@@ -303,9 +339,14 @@ Prefer `app.py` over the `lighthouse` console script here: the script only exist
 on `PATH` if the editable install happened, and `app.py` needs nothing more than
 the third-party dependencies.
 
-**Unauthenticated access.** If the Application is created with platform
-authentication *enabled*, CML puts Cloudera SSO in front of it and a bearer-token
-client gets a login page. See §6 — that is the measurement, not an assumption.
+**Unauthenticated access: create this Application with platform authentication
+*disabled*.** With it enabled, CML puts Cloudera SSO in front of the Application
+and a bearer-token client gets a login page. That is no longer an assumption —
+observed 2026-10-04 (§6), as a 302 to the workbench login, from a caller
+*inside* the workbench. Two consequences worth having in mind before you flip
+the toggle: a device holding a valid `LIGHTHOUSE_ADMIN_TOKEN` cannot enrol
+through SSO, and the redirect fires at the ingress, so while it is on you cannot
+use the URL to test anything *about* the Application, the port included.
 
 **Write down which way you set that toggle.** §6's result cannot be read back
 without it: "SSO-gated" means one thing if you opted in and something entirely
@@ -459,7 +500,25 @@ The last three are **findings, not failures of this document.** Record what you
 saw; the device-side setup (`docs/jetson-setup.md`) depends on which row you are
 in.
 
-**A partial answer already exists, from a different Application in the same
+**Row 2 is where an authentication-enabled Application lands, and you do not
+need the VPN off to see it.** Observed 2026-10-04, curling
+`/api/v1/health` from a terminal in a CAI **Session** — the baseline run, inside
+the workbench:
+
+```
+<a href="https://<workbench-domain>/login?next=https://<subdomain>.<workbench-domain>/api/v1/health">Found</a>.
+```
+
+A 302 to the workbench's own login page. Three things worth taking from it. The
+subdomain **routes** — the ingress answered, so the Application's URL exists and
+works even while the UI still withholds the link. The gate applies to
+**in-cluster** callers with no browser session, so there is no "trusted inside
+the workbench" exemption to lean on. And the redirect comes from the ingress
+*before* anything reaches the Application, which means a 302 here tells you
+nothing about whether your process bound the right port — fix the auth toggle
+first, then the port question becomes answerable.
+
+**The rest of the answer comes from a different Application in the same
 tenant.** Observed 2026-10-04: a container on a home network with the VPN
 **off** reached a CAI Application by its app URL and got served — but only after
 **authentication was disabled on that Application**. Read that carefully,

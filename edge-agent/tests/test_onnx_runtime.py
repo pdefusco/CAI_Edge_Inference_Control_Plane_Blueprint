@@ -23,12 +23,18 @@ suite into evidence of nothing.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
-from keeper.runtime.base import ModelLoadError, ModelRuntime, ModelStartError
+from keeper.runtime.base import (
+    InferenceRuntimeError,
+    ModelLoadError,
+    ModelRuntime,
+    ModelStartError,
+)
 from keeper.runtime.onnx import _PREFERRED_PROVIDERS, OnnxRuntime
 
 
@@ -180,14 +186,75 @@ class TestProviderSelection:
 
 
 class TestLoadFailures:
+    """The pre-flight checks exist because onnxruntime's own messages for these
+    describe the parse rather than the cause. Measured against onnxruntime 1.30.0
+    on 2026-10-04, an operator debugging over SSH would have got
+    `INVALID_PROTOBUF ... Protobuf parsing failed` for a directory, `FAIL ... system
+    error number 13` for a file the agent cannot read, and for an empty file a
+    truncated path from onnxruntime's own build machine.
+
+    Each test asserts onnxruntime was never reached, which is the other half: these
+    are not better messages layered on top of a successful call, they are refusals.
+    """
+
     def test_a_missing_path_is_a_load_error_and_never_reaches_onnxruntime(
         self, tmp_path: Path
     ) -> None:
         ort = FakeOrt()
         runtime = OnnxRuntime(ort=ort)
-        with pytest.raises(ModelLoadError):
+        with pytest.raises(ModelLoadError, match="does not exist"):
             runtime.load(str(tmp_path / "absent.onnx"), name="m", version="1")
         assert ort.sessions == []
+
+    def test_a_directory_says_so_and_names_the_likely_cause(self, tmp_path: Path) -> None:
+        """The realistic way this happens: an MLmodel `data` field naming the model
+        *directory*, which is a legal MLflow layout for some flavours. The old
+        message was `not an ONNX file:` for this and for every other case."""
+        directory = tmp_path / "model"
+        directory.mkdir()
+        ort = FakeOrt()
+        with pytest.raises(ModelLoadError, match="directory"):
+            OnnxRuntime(ort=ort).load(str(directory), name="m", version="1")
+        assert ort.sessions == []
+
+    def test_an_unreadable_file_names_the_permission_problem(self, tmp_path: Path) -> None:
+        """The failure this milestone is most likely to actually hit: the unit runs
+        as `User=keeper` and an artifact unpacked by a root-run install step is an
+        easy mistake. onnxruntime calls that `system error number 13`."""
+        path = tmp_path / "model.onnx"
+        path.write_bytes(b"\x08\x09")
+        path.chmod(0o000)
+        if os.access(path, os.R_OK):
+            pytest.skip("running as a user that ignores file modes (root?)")
+        ort = FakeOrt()
+        try:
+            with pytest.raises(ModelLoadError, match="not readable"):
+                OnnxRuntime(ort=ort).load(str(path), name="m", version="1")
+        finally:
+            path.chmod(0o644)
+        assert ort.sessions == []
+
+    def test_an_empty_file_says_it_is_empty(self, tmp_path: Path) -> None:
+        """A zero-byte `.onnx` is what a truncated write or a failed packaging step
+        leaves behind. It would have to pass the artifact SHA-256 to get here, so
+        this is a packaging bug rather than a transport one -- which is exactly why
+        the message should not be about protobuf."""
+        path = tmp_path / "model.onnx"
+        path.write_bytes(b"")
+        ort = FakeOrt()
+        with pytest.raises(ModelLoadError, match="empty"):
+            OnnxRuntime(ort=ort).load(str(path), name="m", version="1")
+        assert ort.sessions == []
+
+    def test_a_file_with_the_wrong_contents_is_left_to_onnxruntime(
+        self, model_file: Path
+    ) -> None:
+        """Deliberately not pre-checked. `INVALID_PROTOBUF` is already the right
+        answer for a file that exists, is readable and is not an ONNX graph, and a
+        magic-byte check here would be a second, worse parser."""
+        ort = FakeOrt(raise_on_load=RuntimeError("INVALID_PROTOBUF"))
+        with pytest.raises(ModelLoadError, match="INVALID_PROTOBUF"):
+            OnnxRuntime(ort=ort).load(str(model_file), name="m", version="1")
 
     @pytest.mark.parametrize(
         "exc",
@@ -337,6 +404,47 @@ class TestFeedConstruction:
         runtime.predict([[0.0]])
         assert ort.sessions[1].runs == [(None, {"new_name": [[0.0]]})]
 
+    def test_a_bare_tensor_is_refused_when_the_graph_declares_no_inputs(
+        self, model_file: Path
+    ) -> None:
+        """This used to build the literal feed `{None: tensor}` and hand it to
+        onnxruntime, which then complained about an invalid feed several frames
+        away from the caller who could have fixed it."""
+        ort = FakeOrt(declared_inputs=[])
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+        runtime.start()
+        with pytest.raises(InferenceRuntimeError, match="0 inputs"):
+            runtime.predict([[0.0]])
+        assert ort.sessions[0].runs == []
+
+    def test_a_bare_tensor_is_refused_when_the_graph_declares_several(
+        self, model_file: Path
+    ) -> None:
+        """Worse than the zero case, because it used to half-succeed: the first
+        input was fed and the rest left missing, so the error came from onnxruntime
+        and said nothing about the other inputs. The message now names them."""
+        ort = FakeOrt(declared_inputs=["image", "mask"])
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+        runtime.start()
+        with pytest.raises(InferenceRuntimeError) as caught:
+            runtime.predict([[0.0]])
+        assert "image" in str(caught.value)
+        assert "mask" in str(caught.value)
+        assert "dict" in str(caught.value)
+        assert ort.sessions[0].runs == []
+
+    def test_a_dict_still_works_for_those_graphs(self, model_file: Path) -> None:
+        """The refusal is about *keying a bare tensor*, not about the graph. A
+        caller who knows the names is always allowed through."""
+        ort = FakeOrt(declared_inputs=["image", "mask"])
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+        runtime.start()
+        runtime.predict({"image": [1.0], "mask": [0.0]})
+        assert ort.sessions[0].runs == [(None, {"image": [1.0], "mask": [0.0]})]
+
     def test_all_outputs_are_requested(self, model_file: Path) -> None:
         """`None` for output names means "every output", which is what a smoke
         check wants: it proves the whole graph executed, not a prefix of it."""
@@ -361,6 +469,76 @@ class TestHardwareInfo:
         assert info["runtime"] == "onnxruntime"
         assert info["cpu_count"]
         assert "-" in info["platform"]
+
+    def test_gpu_available_means_a_gpu_and_not_merely_not_the_cpu(self) -> None:
+        """The exact provider list this MacBook reports, measured 2026-10-04.
+
+        The old test was `any(p != "CPUExecutionProvider")`, which this list
+        satisfies twice: `AzureExecutionProvider` is a remote inference endpoint
+        and not local acceleration at all, and CoreML really does use the GPU but
+        is not what the dashboard's column is asking about. A laptop answering yes
+        makes the column useless for the Jetson fleet it exists to watch.
+        """
+        ort = FakeOrt(
+            available=[
+                "CoreMLExecutionProvider",
+                "AzureExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        )
+        assert OnnxRuntime(ort=ort).hardware_info()["gpu_available"] is False
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["CUDAExecutionProvider", "TensorrtExecutionProvider", "ROCMExecutionProvider"],
+    )
+    def test_gpu_available_is_true_for_a_real_gpu_provider(self, provider: str) -> None:
+        ort = FakeOrt(available=[provider, "CPUExecutionProvider"])
+        assert OnnxRuntime(ort=ort).hardware_info()["gpu_available"] is True
+
+    def test_a_cpu_only_build_reports_no_gpu(self) -> None:
+        ort = FakeOrt(available=["CPUExecutionProvider"])
+        assert OnnxRuntime(ort=ort).hardware_info()["gpu_available"] is False
+
+    def test_the_active_providers_are_reported_once_a_model_is_loaded(
+        self, model_file: Path
+    ) -> None:
+        """The field the acceptance gate actually reads.
+
+        `providers` says what this *build* can do; `active_providers` says what the
+        loaded session is using. They differ in the case that matters: a provider
+        that cannot handle the graph falls back to the CPU silently and per-node, so
+        a fleet that quietly fell back would look like a fleet on the GPU if only
+        availability were reported.
+        """
+        ort = FakeOrt()
+        runtime = OnnxRuntime(ort=ort)
+        assert "active_providers" not in runtime.hardware_info()
+
+        runtime.load(str(model_file), name="m", version="1")
+        info = runtime.hardware_info()
+        assert info["active_providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def test_the_active_providers_come_from_the_session_not_the_build(
+        self, model_file: Path
+    ) -> None:
+        """Pinning the distinction directly: the fake session is made to report
+        something the build does not, so a refactor that reads
+        `get_available_providers` twice fails here."""
+        ort = FakeOrt()
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+        ort.sessions[0].providers = ["CPUExecutionProvider"]
+        info = runtime.hardware_info()
+        assert info["active_providers"] == ["CPUExecutionProvider"]
+        assert info["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert info["gpu_available"] is True  # the build has it; the session is not using it
+
+    def test_unloading_stops_reporting_active_providers(self, model_file: Path) -> None:
+        runtime = OnnxRuntime(ort=FakeOrt())
+        runtime.load(str(model_file), name="m", version="1")
+        runtime.unload()
+        assert "active_providers" not in runtime.hardware_info()
 
     def test_it_survives_an_onnxruntime_that_blows_up(self) -> None:
         """A wheel that imported but cannot enumerate providers is a real Jetson

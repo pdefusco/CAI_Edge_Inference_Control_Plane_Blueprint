@@ -3,6 +3,14 @@
 .dev/
 *.token
 
+# `.env.example` tells you to copy it to `.env` and fill in the admin token and
+# the registry domain. This repo is public and that domain is a tenant
+# identifier, so the copy must never be committable. `.env.example` itself is
+# tracked -- the negation below is what keeps it so.
+.env
+.env.*
+!.env.example
+
 .venv/
 __pycache__/
 *.py[cod]

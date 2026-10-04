@@ -258,18 +258,51 @@ which is precisely the port the engine holds as pid 1. Keep the candidate
 anyway: binding *something* turns an exit-3 crash into a running process that can
 be probed, and the probe is what settles it.
 
-**The test, in order, because the first answer masks the second.** With
-authentication enabled, the ingress answers with a 302 to the workbench login
-before anything reaches the Application (§6), so a 302 says nothing about the
-port. Disable authentication first, then curl `/api/v1/health` again and read the
-result this way:
+**Measured 2026-10-04, and the answer is no: the subdomain does not route to
+8090.** With authentication disabled and uvicorn confirmed listening on 8090 in
+the Application's own log, `GET /api/v1/health` on the public URL returns
+
+```
+HTTP/2 502
+content-length: 0
+x-envoy-upstream-service-time: 24
+server: istio-envoy
+```
+
+Read the three fields together, because they locate the problem. `istio-envoy`
+means the ingress itself answered. A non-zero `upstream-service-time` means it
+*did* dial an upstream — so the route exists and points somewhere. And a 502
+with an empty body is an upstream that accepted the connection and then closed
+it without speaking HTTP, which is what the engine's `jupyter-wsg-launcher` does
+to a plain GET. Envoy is aimed at **8100**, not at us.
+
+Do this in order, because the first answer masks the second: with
+authentication *enabled* the ingress answers 302 to the workbench login before
+dialling anything (§6), so a 302 tells you nothing about the port. Turn
+authentication off first, then curl, then read:
 
 | Result | Meaning |
 | --- | --- |
-| The health JSON | The subdomain routes to 8090. Nothing more to fix; run §6's probe. |
-| 502/503/504, or a CAI error page | The subdomain routes somewhere our process is not — almost certainly 8100. The fix is at creation time, below. |
+| The health JSON | The subdomain routes to the port we bound. Nothing more to fix; run §6's probe. |
+| `502`, `content-length: 0`, `server: istio-envoy` | The route points at a port our process is not on. Fix the port variables, below. |
+| `curl: (52)`/`(56)`, or 503 with no `upstream-service-time` | No upstream at all — the Application is not running. Read its log, not the URL. |
 
-**If the public URL does not reach it, the port variables are overridden.**
+Use `-sS`, never bare `-s`: `-s` suppresses curl's own errors as well as
+progress, so a reset connection and an empty 200 body look identical. `curl -sS
+-o /dev/null -w '%{http_code} %{size_download}\n'` plus `curl -sSi | head` is
+the whole diagnosis.
+
+**`CDSW_APP_PORT` is not advice to your app — it is what CML routes to.** It
+decides both halves: where the Application is expected to listen, and where the
+ingress sends traffic. Setting it by hand therefore moves the *route*, which is
+why no change to an entry script can recover from a bad value, and why
+`app.py`'s fallback produces a process that is healthy and unreachable at the
+same time. **Open question. Measure it; do not assume it.** The 502 above and
+the port variables below are observed; that CML derives the ingress target from
+this variable is the explanation that fits them, not something confirmed against
+CML's own behaviour. Removing the override is the test.
+
+**The port variables here are overridden, and that is the whole bug.**
 Three `CDSW_*` port variables collapsed onto one value is the signature. Look in
 both places an Application inherits from — the Application's own environment
 variables and the Project's (Project Settings → Advanced) — and remove any
@@ -278,10 +311,23 @@ sets all three itself; overriding them aims the server at the engine's own
 ports. Note that `PORT` cannot repair this from the UI: `main.py:302` reads
 `CDSW_APP_PORT` first, so a hand-set `PORT=8090` loses to a hand-set
 `CDSW_APP_PORT=8100`. Setting `CDSW_APP_PORT=8090` directly does work, and is
-the one-variable way to test the mapping without a deploy.
+the one-variable way to test the mapping without a deploy — it moves `app.py`'s
+first candidate and CML's route together, so both ends agree.
 
-**The other creation-time candidate is the runtime's editor, and it explains
-more of the evidence.** Every surprise in §3 — no `__file__`, a live event loop,
+Which two are overridden is readable from the dump. Observed 2026-10-04:
+`CDSW_APP_PORT=8100`, `CDSW_PUBLIC_PORT=8100`, `CDSW_READONLY_PORT=8100`, against
+a service that calls `app` 8090, `public` 8080 and `read_only` 8100. Only the
+read-only value is one CAI would have set on its own; the other two were put
+there by hand and both aimed at the engine. **Where they come from is worth
+checking before blaming the Application**: a project created from a tutorial
+that sets `CDSW_APP_PORT=8100` at the *project* level gives every Application in
+it the same broken route, and the Application's own settings page will look
+innocent.
+
+**The second candidate is the runtime's editor, and it is the one to try if
+removing the overrides does not fix the route.** It explains the other three
+surprises but not the 502: a port variable pointed at the wrong port would
+misroute under any editor. Every surprise in §3 — no `__file__`, a live event loop,
 the engine holding `CDSW_APP_PORT` as pid 1 with a `jupyter-wsg-launcher`
 command line — is a consequence of the script being run by a notebook kernel
 rather than as a process. A runtime whose editor is *not* kernel-backed should

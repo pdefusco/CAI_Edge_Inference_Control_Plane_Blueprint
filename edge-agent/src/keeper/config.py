@@ -11,6 +11,7 @@ the recommended form: an env var is visible in `/proc/<pid>/environ` and in
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,8 +68,18 @@ class AgentSettings:
         return f"{self.control_plane_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
+    """Read one integer setting.
+
+    `env` is a parameter rather than a read of `os.environ` because it used to be
+    the latter, and that silently defeated `load_settings(environ=...)` for all
+    five integer settings: an injected environ configured the strings and the
+    process environment configured the numbers. Nothing failed loudly -- a test
+    passing `KEEPER_POLL_INTERVAL` got the default, and an ambient
+    `KEEPER_POLL_INTERVAL` in a developer's shell changed the result of a test
+    that had injected its own.
+    """
+    raw = env.get(name)
     if not raw:
         return default
     try:
@@ -77,8 +88,8 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
 
 
-def load_settings(environ: dict[str, str] | None = None) -> AgentSettings:
-    env = os.environ if environ is None else environ
+def load_settings(environ: Mapping[str, str] | None = None) -> AgentSettings:
+    env: Mapping[str, str] = os.environ if environ is None else environ
 
     device_id = (env.get("KEEPER_DEVICE_ID") or "").strip()
     if not device_id:
@@ -106,11 +117,11 @@ def load_settings(environ: dict[str, str] | None = None) -> AgentSettings:
     if data_dir:
         settings.data_dir = Path(data_dir).expanduser()
 
-    settings.poll_interval_seconds = _env_int("KEEPER_POLL_INTERVAL", 10)
-    settings.download_timeout_seconds = _env_int("KEEPER_DOWNLOAD_TIMEOUT", 900)
-    settings.request_timeout_seconds = _env_int("KEEPER_REQUEST_TIMEOUT", 30)
-    settings.retry_backoff_initial_seconds = _env_int("KEEPER_RETRY_BACKOFF_INITIAL", 15)
-    settings.retry_backoff_max_seconds = _env_int("KEEPER_RETRY_BACKOFF_MAX", 600)
+    settings.poll_interval_seconds = _env_int(env, "KEEPER_POLL_INTERVAL", 10)
+    settings.download_timeout_seconds = _env_int(env, "KEEPER_DOWNLOAD_TIMEOUT", 900)
+    settings.request_timeout_seconds = _env_int(env, "KEEPER_REQUEST_TIMEOUT", 30)
+    settings.retry_backoff_initial_seconds = _env_int(env, "KEEPER_RETRY_BACKOFF_INITIAL", 15)
+    settings.retry_backoff_max_seconds = _env_int(env, "KEEPER_RETRY_BACKOFF_MAX", 600)
 
     settings.runtime_impl = (env.get("KEEPER_RUNTIME") or "mock").strip().lower()
     if settings.runtime_impl not in {"mock", "onnx"}:

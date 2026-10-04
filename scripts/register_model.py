@@ -11,7 +11,13 @@ The registry's DNS resolves to a private address with `endpointPublicAccess:
 false`. There is no route to it from a laptop, VPN or not. Everything here that
 touches the registry has to run from a Session inside the workbench.
 
-    pip install onnx 'mlflow<3' cdpcli    # none of these is a repo dependency
+    pip install onnx onnxruntime 'mlflow<3' cdpcli   # none is a repo dependency
+
+`onnxruntime` is not optional despite this script never running inference.
+`mlflow.onnx.save_model` calls `_validate_onnx_session_options`, which opens
+with a bare `import onnxruntime` before checking whether any options were
+passed, so logging an ONNX flavor without it fails -- after the run has
+already been created.
 
 `mlflow<3` is a hard pin, not caution. CAI's bundled tracking server
 (`/opt/cmladdons/python/site-packages/tracking_server/`) replaces MLflow's
@@ -26,6 +32,11 @@ can paper over a store that speaks the old constructor. Observed on a real
 workbench with mlflow 3.16.1. If you already have 3.x:
 
     pip install --force-reinstall 'mlflow<3'
+
+`<3` resolved to 2.22.5 on a real workbench and run creation worked. Note
+CAI's own `mlflow-cml-plugin` pins `mlflow-skinny==2.19.0`, so if anything
+else in the tracking path misbehaves, `mlflow==2.19.0` is the version the
+workbench was actually built against.
     python scripts/register_model.py --environment <YOUR-ENV> --dry-run
     python scripts/register_model.py --environment <YOUR-ENV>
 
@@ -94,6 +105,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 import textwrap
 import time
@@ -139,26 +151,34 @@ _TERMINAL_BAD = {"UPLOAD_FAILED", "DELETE_FAILED", "FAILED", "REGISTRATION_FAILE
 
 
 def would_be_deployable(metadata) -> tuple[str, str]:
-    """Replicate `cai.py:_format_and_packaging` (lines 539-563) exactly.
+    """Replicate `cai.py:_format_and_packaging` exactly.
 
     Deliberately a copy and not an import. This runs in a CAI Session where the
     `lighthouse` package is very likely not installed, and a script importing
     the server package would invert the layering `registry/base.py:5` sets up.
     The cost is that this function can drift from the original -- so it is kept
-    to a literal transcription, with the line reference above, and the findings
-    block prints the raw metadata next to the verdict so a human can check the
-    derivation rather than trusting this copy.
+    to a literal transcription, and the findings block prints the raw metadata
+    next to the verdict so a human can check the derivation rather than
+    trusting this copy.
+
+    It drifted once already: `9d03df3` replaced exact equality on
+    `model_repo_type` with token matching, because a value shaped like the enum
+    the rest of that API uses (`"MLFLOW_MODEL"`) would otherwise read as
+    not-MLflow and make every real model undeployable. This copy was still
+    comparing `== "mlflow"`, so it would have mis-reported the findings block
+    in exactly the case the fix was for. Both sides now tokenize.
     """
     if not isinstance(metadata, dict):
         return "UNKNOWN", "raw_file"
-    repo_type = str(metadata.get("model_repo_type") or "").strip().lower()
+    raw = str(metadata.get("model_repo_type") or "").strip().lower()
+    tokens = {t for t in re.split(r"[^a-z0-9]+", raw) if t}
     has_mlflow = "mlflowMetadata" in metadata or "mlflow_metadata" in metadata
     has_hf = "huggingface_metadata" in metadata
     has_ngc = "ngc_metadata" in metadata
 
-    if repo_type == "mlflow" or (has_mlflow and not has_hf and not has_ngc):
+    if "mlflow" in tokens or (has_mlflow and not has_hf and not has_ngc):
         return "ONNX", "mlflow_tar_gz"
-    if repo_type in {"hf", "huggingface", "ngc"} or has_hf or has_ngc:
+    if tokens & {"hf", "huggingface", "ngc"} or has_hf or has_ngc:
         return "UNKNOWN", "raw_file"
     return "UNKNOWN", "raw_file"
 
@@ -182,7 +202,13 @@ def discover_mechanism() -> dict:
     contacts the registry, mints a credential or writes.
     """
     print("\n=== preflight: what this workbench offers ===")
-    found: dict = {"mlflow": None, "cmlapi": None, "cmlapi_methods": [], "onnx": None}
+    found: dict = {
+        "mlflow": None,
+        "cmlapi": None,
+        "cmlapi_methods": [],
+        "onnx": None,
+        "onnxruntime": None,
+    }
 
     onnx_mod = _probe_import("onnx")
     found["onnx"] = getattr(onnx_mod, "__version__", None) if onnx_mod else None
@@ -192,15 +218,19 @@ def discover_mechanism() -> dict:
     found["mlflow"] = getattr(mlflow_mod, "__version__", None) if mlflow_mod else None
     print(f"  mlflow         {found['mlflow'] or '<not installed>'}")
 
-    # onnxruntime matters for a reason that is not obvious:
-    # `mlflow.onnx.get_default_pip_requirements()` pins onnxruntime, which means
-    # it *imports* it. In a Session without onnxruntime, `log_model` can raise
-    # before writing anything. This script passes `pip_requirements` explicitly
-    # to avoid that path, so a missing onnxruntime here is informational.
+    # onnxruntime is REQUIRED to log an ONNX flavor, and not for the reason
+    # this script originally claimed. Passing `pip_requirements` explicitly
+    # does avoid `get_default_pip_requirements()` -- but `save_model` then
+    # calls `_validate_onnx_session_options`, which opens with a bare
+    # `import onnxruntime` before it checks whether any options were even
+    # passed (mlflow 2.22.5, `utils/model_utils.py:300`). There is no
+    # argument that skips it. Observed on a real workbench: the log failed
+    # with ModuleNotFoundError after the run had already been created.
     ort = _probe_import("onnxruntime")
+    found["onnxruntime"] = getattr(ort, "__version__", None) if ort else None
     print(
-        f"  onnxruntime    {getattr(ort, '__version__', None) or '<not installed>'}"
-        "   (not required: pip_requirements is passed explicitly)"
+        f"  onnxruntime    {found['onnxruntime'] or '<not installed>'}"
+        f"   {'' if ort else '<- REQUIRED by mlflow.onnx.log_model'}".rstrip()
     )
 
     cmlapi_mod = _probe_import("cmlapi")
@@ -283,8 +313,11 @@ def log_to_mlflow(model_name: str, experiment: str) -> tuple[str, str, str]:
     `attribute_map`, not assumed.
 
     `pip_requirements` is passed explicitly so MLflow does not call
-    `get_default_pip_requirements()`, which imports onnxruntime and can fail a
-    Session that does not have it. `input_example` is deliberately omitted:
+    `get_default_pip_requirements()`. That is worth doing but is NOT what
+    makes onnxruntime optional -- nothing does. `save_model` reaches
+    `_validate_onnx_session_options`, which imports onnxruntime
+    unconditionally, so the preflight treats it as required.
+    `input_example` is deliberately omitted:
     mlflow >= 2.9 validates an example by predicting with it, which needs a
     runtime and turns a metadata convenience into a hard dependency.
     """
@@ -602,6 +635,22 @@ def main(argv=None) -> int:
     )
     if found["mechanism"] is None and not args.dry_run:
         print(f"\n{no_mechanism}", file=sys.stderr)
+        return 2
+
+    # Checked here rather than discovered inside `log_to_mlflow`, because
+    # `mlflow.start_run()` succeeds first: the real failure left a created,
+    # empty run in the experiment with no artifact under it. Refusing up
+    # front keeps the tracking server free of debris.
+    if found["onnxruntime"] is None and not args.dry_run:
+        print(
+            "\nonnxruntime is required to log an ONNX flavor. `mlflow.onnx."
+            "log_model`\nreaches `_validate_onnx_session_options`, which imports"
+            " it unconditionally;\nno argument skips that path.\n"
+            "    pip install onnxruntime\n"
+            "Refusing now rather than after creating a run that would be left"
+            " empty.",
+            file=sys.stderr,
+        )
         return 2
 
     # Fatal for *both* mechanisms, not just --mechanism mlflow: the cmlapi

@@ -459,6 +459,30 @@ The last three are **findings, not failures of this document.** Record what you
 saw; the device-side setup (`docs/jetson-setup.md`) depends on which row you are
 in.
 
+**A partial answer already exists, from a different Application in the same
+tenant.** Observed 2026-10-04: a container on a home network with the VPN
+**off** reached a CAI Application by its app URL and got served — but only after
+**authentication was disabled on that Application**. Read that carefully,
+because it is evidence about the platform and not about this deployment:
+
+* the off-VPN vantage point is **not** the obstacle. A CAI Application's URL is
+  reachable from an ordinary home network, so row 4 of the table above ("private
+  ingress only") is not where this tenant lands. That was the open risk for the
+  whole device story, and it is retired.
+* **authentication-enabled is the obstacle**, which is row 2. With the toggle on,
+  a non-browser client did not get through; with it off, it did. That matches
+  what §3 says about Cloudera SSO being placed in front of an authenticated
+  Application.
+
+What it does *not* establish: that a bearer token survives the ingress to reach
+our own auth layer, which is row 1 and a different question — that Application
+was not this one and did not use `Authorization: Bearer` against
+`api/auth.py`. So still run `probe_app.py` twice. The value of the finding is
+that it tells you which way to set the toggle **before** you measure, rather than
+discovering it afterwards: create this Application with authentication
+**disabled**, and §3's "write down which way you set that toggle" then has a
+deliberate answer rather than a default.
+
 `probe_app.py` also settles the question recorded at `api/auth.py:22-27` — whether
 CML's ingress forwards custom request headers to an Application — by sending the
 operator credential both as `X-Lighthouse-Admin-Token` and as

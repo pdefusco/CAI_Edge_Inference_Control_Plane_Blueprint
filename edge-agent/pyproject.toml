@@ -2,7 +2,18 @@
 name = "keeper"
 version = "0.1.0"
 description = "Lighthouse edge agent: reconciles local model deployment against CAI desired state"
-requires-python = ">=3.10"
+# 3.11, not 3.10, and this one has teeth: `keeper` depends on
+# `lighthouse-contracts`, which needs 3.11 for `enum.StrEnum`. With ">=3.10"
+# here, `pip install keeper` on a Python 3.10 device SUCCEEDED and then
+# `from keeper.main import run` raised ImportError -- a silent install followed
+# by a crash on first run. Verified 2026-10-04.
+#
+# M4 DECISION, unresolved: JetPack 6 ships Python 3.10, and NVIDIA's aarch64
+# onnxruntime wheels are built against it. So this floor and the target device
+# are in direct conflict. Either the Jetson gets a 3.11 interpreter, or
+# `contracts/enums.py` drops StrEnum. Do not "fix" this by lowering the floor
+# alone: that restores the silent-install-then-crash, which is worse.
+requires-python = ">=3.11"
 # Deliberately minimal. This installs on a Jetson, so it must not drag in
 # FastAPI, boto3 or anything else the control plane needs.
 dependencies = [

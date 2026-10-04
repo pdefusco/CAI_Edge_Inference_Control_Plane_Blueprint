@@ -285,6 +285,15 @@ def run() -> None:
 
     # CDSW_APP_PORT is what CAI routes the Application's public URL to. Binding
     # anything else produces an app that starts cleanly and is unreachable.
+    #
+    # The 8000 fallback is for a laptop only. Inside a CAI *Session* -- which is
+    # where you run this by hand to check it against the real registry -- 8000 is
+    # already held by something outside the user's namespace: the bind fails
+    # EADDRINUSE while `ss -ltn` and `netstat -ltn` both show nothing, so the
+    # cause is invisible from inside. Observed 2026-10-04. Pass `PORT=8900` (or
+    # any free high port) for that, and note uvicorn logs "Application startup
+    # complete" *before* it reports the bind failure, so the log reads like a
+    # successful boot right up to the error.
     port = int(os.environ.get("CDSW_APP_PORT") or os.environ.get("PORT") or 8000)
     host = os.environ.get("LIGHTHOUSE_HOST", "127.0.0.1" if settings.env == "local" else "0.0.0.0")
     uvicorn.run(app, host=host, port=port, log_config=None)

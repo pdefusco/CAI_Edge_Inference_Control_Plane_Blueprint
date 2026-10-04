@@ -16,11 +16,12 @@ rather than left to be rediscovered:
   * versions live at `Model.model_versions`, not `versions`;
   * an empty registry answers `{"models": null}`, not `{"models": []}`.
 
-`boto3` is deliberately never imported here, at any scope, even though it
-rides along in the `cai` extra -- whether the control plane ever needs
-object-store identity is an M3 finding, not an M2 assumption. `httpx` is fine
-at module scope: `api/deps.py` imports this module lazily, specifically so a
-local/fake run never pays for it.
+`boto3` is never imported here, at any scope, and as of M3 it is no longer in
+the `cai` extra either: `/versions/{v}/artifact` streams the bytes itself
+instead of redirecting to presigned object storage, so the control plane needs
+no object-store identity. See `open_artifact` for the measurement. `httpx` is
+fine at module scope: `api/deps.py` imports this module lazily, specifically so
+a local/fake run never pays for it.
 """
 
 from __future__ import annotations

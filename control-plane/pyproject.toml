@@ -16,8 +16,15 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed by the real CAI adapter (M2). Kept out of the base install so the
 # local harness has no cloud dependencies at all.
+#
+# `boto3` was here until M3 and is deliberately gone. It was provisional: if the
+# registry's `/versions/{v}/artifact` route had redirected to presigned object
+# storage, the control plane would have needed an object-store identity of its
+# own. Measured against a real tenant 2026-10-04, that route answers 200 with
+# `application/octet-stream` and gzip magic -- no redirect, so no S3 client and
+# no second credential. Re-add it only if a tenant is observed redirecting, and
+# note that `registry/base.py:5` forbids importing it above the adapter anyway.
 cai = [
-    "boto3>=1.34",
     "httpx>=0.27",
 ]
 dev = [

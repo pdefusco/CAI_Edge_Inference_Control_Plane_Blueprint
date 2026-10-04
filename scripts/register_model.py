@@ -304,6 +304,22 @@ def discover_mechanism() -> dict:
 # --------------------------------------------------------------------------
 
 
+def lookup_experiment_id(run_id: str) -> str:
+    """Find the experiment holding `run_id`, or "" if it cannot be read.
+
+    Read-only, and tolerant: a failure here is not fatal on its own, because
+    `--experiment-id` can supply the answer directly.
+    """
+    try:
+        import mlflow
+
+        run = mlflow.get_run(run_id)
+        return str(run.info.experiment_id or "")
+    except Exception as exc:  # the store is remote; any of several failures
+        print(f"  could not look up the run's experiment: {type(exc).__name__}")
+        return ""
+
+
 def log_to_mlflow(model_name: str, experiment: str) -> tuple[str, str, str]:
     """Log the graph as an MLflow run artifact.
 
@@ -387,6 +403,7 @@ def register(
     *,
     experiment_id: str = "",
     project_id: str = "",
+    visibility: str = "",
 ) -> str | None:
     """Promote the logged run artifact into the AI Registry.
 
@@ -426,8 +443,18 @@ def register(
         "run_id": run_id,
         "model_path": artifact_path,
         "model_name": model_name,
-        "visibility": "private",
     }
+    # `visibility` is deliberately NOT sent by default. It is optional, and it
+    # is a protobuf enum whose accepted values are not in the generated client
+    # -- `attribute_map` types it `str`, so nothing local can validate it. A
+    # guessed `"private"` was rejected on a real workbench with
+    #   400 {"error":"unknown value \"\\\"private\\\"\" for enum Visibility"}
+    # after the run had already been logged. Omitting the field lets the
+    # server apply its own default instead of making this script guess at an
+    # enum it cannot see; pass --visibility to set it deliberately once the
+    # accepted spelling is known.
+    if visibility:
+        body["visibility"] = visibility
     # Build the typed request when the class is there, so the generated
     # client validates the field names instead of posting a dict the server
     # may quietly ignore.
@@ -577,6 +604,27 @@ def parse_args(argv=None):
         "$CML_PROJECT_ID. Never defaulted",
     )
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
+    parser.add_argument(
+        "--visibility",
+        default="",
+        help="value for the cmlapi `visibility` enum. Omitted by default so "
+        "the server applies its own: the accepted spellings are not in the "
+        'generated client, and a guessed "private" was rejected with 400 '
+        '"unknown value for enum Visibility"',
+    )
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="reuse an already-logged MLflow run instead of logging a new "
+        "one. Use this when registration failed after the run succeeded, so a "
+        "retry does not leave another orphan run behind. Needs --experiment-id "
+        "too when the run is not in the named experiment",
+    )
+    parser.add_argument(
+        "--experiment-id",
+        default="",
+        help="experiment holding --run-id, if it cannot be looked up",
+    )
     parser.add_argument(
         "--mechanism",
         default="auto",
@@ -732,8 +780,27 @@ def main(argv=None) -> int:
         print("\n  re-run without --dry-run to register for real")
         return 0
 
-    print("\n=== logging to MLflow ===")
-    run_id, artifact_path, experiment_id = log_to_mlflow(args.model_name, args.experiment)
+    if args.run_id:
+        # Registration is the step still being discovered against a real
+        # workbench, and every failed attempt used to log a fresh run. Reusing
+        # one keeps retries from littering the experiment.
+        print("\n=== reusing an already-logged run ===")
+        run_id, artifact_path = args.run_id, "model"
+        experiment_id = args.experiment_id or lookup_experiment_id(args.run_id)
+        print(f"  run {run_id} (experiment {experiment_id or '<unknown>'})")
+        print("  nothing new was logged")
+        if not experiment_id:
+            print(
+                "\ncould not determine the experiment for that run; pass\n"
+                "--experiment-id. cmlapi registration needs it.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        print("\n=== logging to MLflow ===")
+        run_id, artifact_path, experiment_id = log_to_mlflow(
+            args.model_name, args.experiment
+        )
 
     print("\n=== registering ===")
     project_id = (
@@ -746,6 +813,7 @@ def main(argv=None) -> int:
         artifact_path,
         experiment_id=experiment_id,
         project_id=project_id,
+        visibility=args.visibility,
     )
     print(f"  registry reported version {version!r}")
 

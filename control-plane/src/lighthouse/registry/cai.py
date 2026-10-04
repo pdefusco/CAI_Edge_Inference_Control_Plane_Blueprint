@@ -573,26 +573,32 @@ def _format_and_packaging(metadata: dict[str, Any]) -> tuple[ArtifactFormat, Pac
     # presuming MLflow: UNKNOWN makes `get_version` refuse with
     # `UnsupportedFlavor` at the deploy gate.
     #
-    # M3 note, and read this before changing it. The original reason for
-    # UNKNOWN was that a wrong ONNX guess "would fail on the device after a
-    # download". That is now only half true: `artifact_service` refuses a
-    # readable MLflow tarball with no `.onnx` member server-side, before any
-    # device fetches anything. What it deliberately does *not* refuse is a
-    # tarball it could not open at all, since that is a transport symptom
-    # rather than a flavor one -- so an optimistic guess here still reaches a
-    # device for a non-tar artifact.
+    # M3 SETTLED (2026-10-04), against the registry's own `/swagger.json` and
+    # a real registered version. This line used to carry two candidate
+    # realities needing opposite fixes; the spec rules one of them out
+    # outright:
     #
-    # That leaves two candidate realities and they need opposite fixes, which
-    # is why neither is applied on speculation:
+    #   ModelVersionMetadata:
+    #     *model_repo_type   string  enum=MLFLOW,HF,NGC      <- required
     #
-    #   * `model_repo_type` is enum-shaped (`"MLFLOW_MODEL"`). Fixed above by
-    #     token matching; this line stays exactly as it is.
-    #   * `metadata` is genuinely `{}` for a normally-registered MLflow
-    #     model. Then this line is what makes every real model undeployable
-    #     and it has to return ONNX/MLFLOW_TAR_GZ.
+    # `model_repo_type` is REQUIRED and its domain is exactly those three
+    # values, so the feared case -- `metadata` genuinely `{}` for a normally
+    # registered MLflow model, which would have made every real model
+    # undeployable and forced this line to return ONNX -- cannot occur for a
+    # version the registry itself produced. A real version was observed
+    # reporting `model_repo_type: "MLFLOW"` with a fully populated
+    # `mlflowMetadata`. All three enum values are handled above: "MLFLOW"
+    # tokenizes to {"mlflow"}, "HF" to {"hf"}, "NGC" to {"ngc"}.
     #
-    # `tests/test_cai_registry.py` carries the evidence slot that decides
-    # between them; it stays skipped until an observed payload is dropped in.
+    # So this fall-through is now unreachable for well-formed registry output
+    # and exists purely to fail closed on a malformed or truncated response.
+    # UNKNOWN makes `get_version` refuse with `UnsupportedFlavor` at the
+    # deploy gate, which is the right answer for a payload this code cannot
+    # identify -- do not "simplify" it into an optimistic ONNX guess. A
+    # tarball that cannot be opened at all is deliberately not refused by
+    # `artifact_service` (that is a transport symptom, not a flavor one), so
+    # an optimistic guess here would still reach a device for a non-tar
+    # artifact.
     return ArtifactFormat.UNKNOWN, Packaging.RAW_FILE
 
 
@@ -827,13 +833,14 @@ class CAIModelRegistry:
     # -- listing / resolution ------------------------------------------------
 
     def _fetch_all_models(self) -> list[dict[str, Any]]:
-        """Page through `GET /models`, tolerating an unknown page-token
-        request parameter.
+        """Page through `GET /models`.
 
-        The response field `next_page_token` is confirmed; the request
-        parameter that sends it back is not. Guarding against a token that
-        never advances means a wrong parameter name degrades to "first page
-        only" instead of looping forever.
+        `page_token` is CONFIRMED (2026-10-04) against the registry's own
+        `/swagger.json`, which lists exactly four query parameters on this
+        route: `page_size`, `page_token`, `search_filter`, `sort`. It used to
+        be a guess, hence the non-advancing-token guard below -- which is
+        kept, because it also covers a server that returns the same token
+        forever, and that is a real failure mode independent of the name.
         """
         all_models: list[dict[str, Any]] = []
         seen_tokens: set[str] = set()
@@ -899,6 +906,11 @@ class CAIModelRegistry:
         if cached is not None:
             return cached
         model_id = self._resolve_model_id(model_name)
+        # `GET /models/{model_id}`, deliberately -- NOT
+        # `/models/{model_id}/versions`, which does not exist and answers 405
+        # (observed 2026-10-04; the spec's 11 paths confirm no collection
+        # route for versions, only `/versions/{version}` for a single one).
+        # Versions arrive nested under the model as `model_versions`.
         body = self._client.get_json(f"/models/{model_id}")
         raw_versions = body.get("model_versions") or []
         parsed = [
@@ -949,6 +961,40 @@ class CAIModelRegistry:
     # -- artifact bytes ------------------------------------------------------
 
     def open_artifact(self, mv: RegistryModelVersion) -> ArtifactStream:
+        """Stream the version's bytes from the registry's own artifact route.
+
+        OBSERVED 2026-10-04 against a real registered MLflow version, which
+        settles the last of M2's three open questions:
+
+            status           = 200
+            Content-Type     = application/octet-stream
+            Content-Length   = 876
+            Content-Encoding = <absent>
+            body             starts 1f 8b (gzip magic)
+
+        Three consequences worth stating, because each was an open risk:
+
+        * **No redirect.** The registry streams the bytes itself rather than
+          302-ing to presigned object storage, so the control plane needs no
+          object-store identity of its own. That is why there is still no
+          `boto3` anywhere above this layer, and nothing here needs one.
+        * **`Packaging.MLFLOW_TAR_GZ` is right**, confirmed by the gzip magic
+          rather than inferred from the `.tar.gz` suffix.
+        * **No transparent-decode trap**, this time. `Content-Encoding` was
+          absent, so httpx hands over the gzip stream intact. The probe below
+          still logs that header, because this is one tenant's behaviour and
+          the failure it guards against is close to undiagnosable.
+
+        Note `artifact_uri` on the version is an `s3a://` path into tenant
+        object storage -- unreachable with the registry credential, and not a
+        fetch path. This route is the only way to the bytes.
+
+        The spec declares `produces: multipart/form-data` for this route while
+        the server actually sent `application/octet-stream`. The branching in
+        `_open_artifact_stream` keys off the *observed* `Content-Type` and so
+        handles both; the multipart branch is simply unexercised so far. Do
+        not delete it on the strength of one tenant's response.
+        """
         response = self._client.send_stream(
             "GET", f"/models/{mv.model_id}/versions/{mv.version}/artifact"
         )

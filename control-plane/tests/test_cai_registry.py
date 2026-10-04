@@ -386,7 +386,20 @@ def test_each_registry_status_maps_to_the_error_an_operator_can_act_on(status, e
     operator needs is different for each bucket: retry later (not-ready),
     register a new version (failed), or stop looking (gone). Collapsing any
     two of these into the same exception would send an operator to the wrong
-    dashboard."""
+    dashboard.
+
+    "All eight" is now a fact rather than a hope. The registry's served
+    `/swagger.json` (fetched 2026-10-04) declares exactly:
+
+        Status: enum=REGISTERING,UPLOADING,READY,UPLOAD_FAILED,DELETED,
+                     DELETING,DELETE_FAILED,UNKNOWN
+
+    which is this list and nothing else -- so this parametrize is exhaustive,
+    and `get_version`'s final `!= READY` catch-all is dead code against
+    today's API, kept only to fail closed on a value a future version adds.
+    `UPLOADING` is also not hypothetical: a real registration sat in it for
+    several polls before reaching READY.
+    """
     handler = _route(
         {
             ("GET", f"{PREFIX}/models"): httpx.Response(200, json={"models": [_model_entry("model-1", "fashion-cnn")]}),
@@ -533,18 +546,54 @@ def test_a_repo_type_that_merely_contains_hf_is_not_read_as_huggingface():
     assert registry.get_version("fashion-cnn", "1").format is ArtifactFormat.ONNX
 
 
-def test_empty_metadata_is_refused_and_this_is_the_line_m3_may_have_to_change():
-    """Pinning today's behaviour so the change is deliberate when it comes.
+@pytest.mark.parametrize(
+    ("repo_type", "deployable"),
+    [("MLFLOW", True), ("HF", False), ("NGC", False)],
+)
+def test_the_three_real_enum_values_from_the_served_spec(repo_type, deployable):
+    """The authoritative domain, not a guess at its shape.
 
-    If the tenant reports `{}` for a normally-registered MLflow model, this
-    assertion is what has to be inverted -- and inverting it makes every
-    version in the registry deployable on no evidence at all, which is why it
-    waits on the observed payload rather than on an argument.
+    The registry's own `/swagger.json` (fetched 2026-10-04) declares:
+
+        ModelVersionMetadata:
+          *model_repo_type   string  enum=MLFLOW,HF,NGC
+
+    Every other `repo_type` case in this file is a hypothesis about what the
+    value *might* look like. These three are what it can actually be, and the
+    field is required -- so these are the only inputs that matter in
+    production. Note `"HF"` and `"NGC"` are the bare two- and three-letter
+    forms; the longer `"HUGGINGFACE_MODEL"`-style spellings tested above do
+    not occur.
+    """
+    registry, _ = _registry_for(_settings(), _version_with({"model_repo_type": repo_type}))
+
+    if deployable:
+        assert registry.get_version("fashion-cnn", "1").format is ArtifactFormat.ONNX
+    else:
+        with pytest.raises(UnsupportedFlavor):
+            registry.get_version("fashion-cnn", "1")
+
+
+def test_empty_metadata_is_refused_which_the_spec_says_cannot_happen_anyway():
+    """Fail-closed on malformed output, not a pending decision.
+
+    This assertion used to be the one M3 might have had to invert -- if a
+    normally-registered MLflow model reported `{}`, refusing here would make
+    every version in the registry undeployable. The served spec settles it the
+    other way: `model_repo_type` is *required* with domain MLFLOW/HF/NGC, so
+    `{}` is not something the registry produces for a version it created.
+
+    So this is no longer a placeholder for a decision. It pins fail-closed
+    behaviour for a response this code cannot identify -- truncated, malformed,
+    or from a future API that drops the field -- and inverting it would mean
+    deploying unidentified bytes to a device.
     """
     registry, _ = _registry_for(_settings(), _version_with({}))
 
     with pytest.raises(UnsupportedFlavor):
         registry.get_version("fashion-cnn", "1")
+
+
 
 
 # The evidence slot. Deliberately read from `.dev/`, which `.gitignore` has

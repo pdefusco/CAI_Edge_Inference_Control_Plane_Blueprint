@@ -185,22 +185,41 @@ uvicorn dies with
 ```
 
 *after* logging `Application startup complete`, so the log reads as a healthy
-boot right up to the error. Observed 2026-10-04 in a deployed Application. A
-kernel-backed Application serves on `CDSW_READONLY_PORT` instead — the pattern a
-sibling blueprint (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`)
-has deployed successfully.
+boot right up to the error. Observed 2026-10-04 in a deployed Application.
 
-`app.py` resolves this by **trying to bind**: `CDSW_APP_PORT` first, falling back
-to `CDSW_READONLY_PORT` only when the first is genuinely taken, and logging which
-it chose and why. Hardcoding the read-only port would only move the breakage,
-because both variables are set either way — a plain-process Application would
-then bind a port nothing routes to and look perfectly healthy while being
-unreachable. So **set neither variable yourself**, and leave `LIGHTHOUSE_HOST`
-unset too: `main.py:298` already binds `0.0.0.0` whenever the env is not `local`,
-which a loopback proxy reaches.
+A sibling blueprint (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`)
+serves a FastAPI app from a CAI Application successfully by binding
+`$CDSW_READONLY_PORT`, so `app.py` **tries to bind** rather than trusting either
+variable: `CDSW_APP_PORT` first, `CDSW_READONLY_PORT` as a fallback, logging
+which it chose and why. Hardcoding the read-only port would only move the
+breakage, because both variables are set either way — a plain-process
+Application would then bind a port nothing routes to and look perfectly healthy
+while being unreachable.
 
-If the Application still exits on a bind error, read the stderr line `app.py`
-prints — it names every port it tried and the errno for each.
+**Open question. Measure it; do not assume it.** The fallback did not help here,
+and the reason rules out the obvious explanation: in this tenant
+`CDSW_APP_PORT` and `CDSW_READONLY_PORT` are **the same port** (8100), and it was
+already in use before the process started. Observed 2026-10-04. So the
+difference between this deployment and the sibling blueprint's working one is
+*not* which variable it binds — something in this Application container holds
+the routed port and does not hold it there. What that something is decides the
+fix, and the two possibilities need opposite responses:
+
+* **an earlier instance of this app** — stop the Application completely and
+  start it again, rather than restarting it;
+* **part of the engine** — then this Application *kind* cannot host a server on
+  the routed port at all, and the answer is at creation time, not in the code.
+  Compare the runtime and editor selection against an Application known to serve
+  (the sibling blueprint's) and match it.
+
+`app.py` reports which on the failure path: it reads `/proc` to name the pid and
+command line holding the port, because `ss` and `netstat` have both shown
+nothing for this class of conflict inside a CAI container. Read that stderr line
+before changing anything.
+
+**Set neither port variable yourself**, and leave `LIGHTHOUSE_HOST` unset too:
+`main.py:298` already binds `0.0.0.0` whenever the env is not `local`, which a
+loopback proxy reaches.
 
 **That 8000 fallback is a laptop-only convenience, and it bites in a Session.**
 Port 8000 inside a CAI Session is held by something outside your namespace: the

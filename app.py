@@ -96,6 +96,63 @@ for _pkg in _PACKAGES:
 from lighthouse.main import run
 
 
+def _port_holder(port: int, *, proc: Path = Path("/proc")) -> str:
+    """Best-effort description of the process already listening on `port`.
+
+    Only ever called on the failure path, where the errno alone is not
+    actionable: "address already in use" on the one port CAI routes is either a
+    leftover of ours (restart it) or part of the engine (change how the
+    Application runs), and those have completely different fixes. Observed
+    2026-10-04 in a deployed Application, where `CDSW_APP_PORT` and
+    `CDSW_READONLY_PORT` were *the same port* and both were taken, so there was
+    no fallback left and no way to tell the two causes apart from the log.
+
+    Reads `/proc` directly because `ss` and `netstat` have both shown nothing
+    for this class of conflict inside a CAI container (`main.py:286-295`).
+    Returns "" when it cannot tell, and must never raise: a diagnostic that
+    replaces the real error with its own traceback is worse than no diagnostic.
+    """
+    try:
+        wanted = f"{port:04X}"
+        inodes = set()
+        for name in ("net/tcp", "net/tcp6"):
+            try:
+                lines = (proc / name).read_text().splitlines()[1:]
+            except OSError:
+                continue
+            for line in lines:
+                fields = line.split()
+                # 0x0A is TCP_LISTEN; a connected socket on this port is a
+                # client of someone else's and not what is blocking the bind.
+                if len(fields) > 9 and fields[1].rsplit(":", 1)[-1] == wanted and fields[3] == "0A":
+                    inodes.add(fields[9])
+        if not inodes:
+            return ""
+
+        for entry in sorted(proc.iterdir()):
+            if not entry.name.isdigit():
+                continue
+            try:
+                fds = list((entry / "fd").iterdir())
+            except OSError:
+                continue  # Someone else's process, or it just exited.
+            for fd in fds:
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if not (target.startswith("socket:[") and target[8:-1] in inodes):
+                    continue
+                try:
+                    cmd = (entry / "cmdline").read_text().replace("\0", " ").strip()
+                except OSError:
+                    cmd = ""
+                return f"held by pid {entry.name}" + (f" ({cmd[:160]})" if cmd else "")
+        return "held by a process outside this container's view"
+    except Exception:  # noqa: BLE001 -- never let the diagnostic mask the error
+        return ""
+
+
 def _pick_port() -> None:
     """Choose between the two ports CAI offers, by trying to bind them.
 
@@ -133,6 +190,7 @@ def _pick_port() -> None:
         return  # Explicitly asked for; not ours to second-guess.
 
     tried: list[str] = []
+    failed_ports: list[int] = []
     for name in ("CDSW_APP_PORT", "CDSW_READONLY_PORT"):
         raw = os.environ.get(name)
         if not raw:
@@ -150,6 +208,7 @@ def _pick_port() -> None:
                 probe.bind(("0.0.0.0", port))
             except OSError as exc:
                 tried.append(f"{name}={port} ({exc.strerror})")
+                failed_ports.append(port)
                 continue
         if tried:
             print(
@@ -165,11 +224,20 @@ def _pick_port() -> None:
         return
 
     if tried:
-        print(
-            "no CAI-provided port could be bound: " + ", ".join(tried)
-            + ". Letting main.py choose, which will almost certainly fail too.",
-            file=sys.stderr,
+        lines = [
+            "no CAI-provided port could be bound: " + ", ".join(tried) + ".",
+        ]
+        for failed in sorted(set(failed_ports)):
+            holder = _port_holder(failed)
+            if holder:
+                lines.append(f"  port {failed} is {holder}")
+        lines.append(
+            "  If that is an earlier instance of this app, stop the Application"
+            " fully and start it again rather than restarting it. If it is part"
+            " of the engine, this Application kind cannot host a server on the"
+            " routed port -- see `docs/cai-deployment.md` §3."
         )
+        print("\n".join(lines), file=sys.stderr)
 
 
 def serve() -> None:

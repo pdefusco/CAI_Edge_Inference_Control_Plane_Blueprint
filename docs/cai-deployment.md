@@ -173,11 +173,34 @@ the Application's own environment:
 python3 -c 'import fastapi, httpx; print("ok")'
 ```
 
-**Port.** CAI sets `CDSW_APP_PORT` and routes the Application's public URL to it.
-`main.py:297` reads `CDSW_APP_PORT` first, then `PORT`, then falls back to 8000 —
-so in an Application you set **neither**, and binding anything else yields an app
-that starts cleanly and is unreachable. Leave `LIGHTHOUSE_HOST` unset too:
-`main.py:298` already binds `0.0.0.0` whenever the env is not `local`.
+**Port — and `CDSW_APP_PORT` is not always the answer.** CAI sets both
+`CDSW_APP_PORT` and `CDSW_READONLY_PORT`, and which one the public URL is proxied
+from depends on how the Application runs your script. `main.py:297` prefers
+`CDSW_APP_PORT`, which is correct for an Application that runs as a plain
+process. Under the kernel it is not: the engine already holds that port, and
+uvicorn dies with
+
+```
+[Errno 98] error while attempting to bind on address ('0.0.0.0', 8100): address already in use
+```
+
+*after* logging `Application startup complete`, so the log reads as a healthy
+boot right up to the error. Observed 2026-10-04 in a deployed Application. A
+kernel-backed Application serves on `CDSW_READONLY_PORT` instead — the pattern a
+sibling blueprint (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`)
+has deployed successfully.
+
+`app.py` resolves this by **trying to bind**: `CDSW_APP_PORT` first, falling back
+to `CDSW_READONLY_PORT` only when the first is genuinely taken, and logging which
+it chose and why. Hardcoding the read-only port would only move the breakage,
+because both variables are set either way — a plain-process Application would
+then bind a port nothing routes to and look perfectly healthy while being
+unreachable. So **set neither variable yourself**, and leave `LIGHTHOUSE_HOST`
+unset too: `main.py:298` already binds `0.0.0.0` whenever the env is not `local`,
+which a loopback proxy reaches.
+
+If the Application still exits on a bind error, read the stderr line `app.py`
+prints — it names every port it tried and the errno for each.
 
 **That 8000 fallback is a laptop-only convenience, and it bites in a Session.**
 Port 8000 inside a CAI Session is held by something outside your namespace: the

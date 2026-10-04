@@ -283,8 +283,13 @@ def run() -> None:
         print(f"configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    # CDSW_APP_PORT is what CAI routes the Application's public URL to. Binding
-    # anything else produces an app that starts cleanly and is unreachable.
+    # CDSW_APP_PORT is what CAI routes the Application's public URL to *when the
+    # Application runs the script as a plain process*. When it runs it through a
+    # kernel instead, the engine already holds that port and the URL is proxied
+    # from CDSW_READONLY_PORT; `app.py` picks between the two by trying to bind
+    # and hands the winner over as PORT, so this precedence stays generic. See
+    # `docs/cai-deployment.md` §3. Binding a port nothing routes to produces an
+    # app that starts cleanly and is unreachable.
     #
     # The 8000 fallback is for a laptop only. Inside a CAI *Session* -- which is
     # where you run this by hand to check it against the real registry -- 8000 is

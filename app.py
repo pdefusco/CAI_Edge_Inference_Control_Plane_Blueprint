@@ -8,16 +8,19 @@ Everything that decides whether the process is reachable -- the port, the bind
 address, the exit-2-on-ConfigError path -- is already in `main.py:268-299`, and
 this file must not duplicate or second-guess any of it.
 
-What it does own is *reaching* `run()` at all, which took two measurements
-against a real Application to get right. Both are here, both are commented with
-what was observed, and neither changes what the server does once it is up:
-finding the project root without `__file__`, and starting the server when the
-caller already has a running event loop.
+What it does own is *reaching* `run()` at all, which took three measurements
+against a real Application to get right. All three are here, each commented with
+what was observed, and none changes what the server does once it is up: finding
+the project root without `__file__`, starting the server when the caller already
+has a running event loop, and picking the one CAI-provided port that is actually
+bindable.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -93,6 +96,82 @@ for _pkg in _PACKAGES:
 from lighthouse.main import run
 
 
+def _pick_port() -> None:
+    """Choose between the two ports CAI offers, by trying to bind them.
+
+    `main.py:297` prefers `CDSW_APP_PORT`, which is right for an Application
+    that runs as a plain process. Under the kernel it is wrong: the engine
+    already holds it, and uvicorn dies with
+
+        [Errno 98] error while attempting to bind on address
+        ('0.0.0.0', 8100): address already in use
+
+    *after* logging `Application startup complete`, so the log reads as a
+    healthy boot. Observed 2026-10-04 in a deployed Application. The public URL
+    for that kind of Application is proxied off `CDSW_READONLY_PORT` instead --
+    the pattern a sibling blueprint (`CAI_Agentic_NBA_Observability_Blueprint`,
+    `launch_app.py`) has deployed successfully.
+
+    Hardcoding the read-only port would just move the breakage: both variables
+    are set either way, so a plain-process Application would then bind a port
+    nothing routes to and look healthy while being unreachable. Binding is the
+    only test that distinguishes them, so that is the test -- preferring
+    `CDSW_APP_PORT` and falling back only when it is genuinely taken, which
+    needs no knowledge of which runtime kind this is.
+
+    An explicit `PORT` disables the probe entirely, because silently overriding
+    one would be a bug: `CDSW_READONLY_PORT` is set in a *Session* too, so the
+    by-hand command in `docs/cai-deployment.md` §3 (`env -u CDSW_APP_PORT
+    PORT=8900 python app.py`) would otherwise bind something other than 8900 and
+    report success. Disabling the probe leaves `main.py:297`'s precedence
+    untouched rather than inverting it -- so `PORT` decides only if
+    `CDSW_APP_PORT` is unset, which is exactly what that `env -u` is for.
+
+    Nothing happens on a laptop either, where no CAI variable is set.
+    """
+    if os.environ.get("PORT"):
+        return  # Explicitly asked for; not ours to second-guess.
+
+    tried: list[str] = []
+    for name in ("CDSW_APP_PORT", "CDSW_READONLY_PORT"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            port = int(raw)
+        except ValueError:
+            tried.append(f"{name}={raw!r} (not a number)")
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # The same option uvicorn sets, so this probe succeeds exactly when
+            # uvicorn's own bind would.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("0.0.0.0", port))
+            except OSError as exc:
+                tried.append(f"{name}={port} ({exc.strerror})")
+                continue
+        if tried:
+            print(
+                f"{name}={port} is free; not using " + ", ".join(tried),
+                file=sys.stderr,
+            )
+        # Handed over as `PORT` with `CDSW_APP_PORT` cleared, which is how
+        # `docs/cai-deployment.md` §3 already tells you to override the port by
+        # hand (`env -u CDSW_APP_PORT PORT=8900`). `main.py` stays generic and
+        # keeps deciding the port in one place.
+        os.environ["PORT"] = str(port)
+        os.environ.pop("CDSW_APP_PORT", None)
+        return
+
+    if tried:
+        print(
+            "no CAI-provided port could be bound: " + ", ".join(tried)
+            + ". Letting main.py choose, which will almost certainly fail too.",
+            file=sys.stderr,
+        )
+
+
 def serve() -> None:
     """Call `run()`, tolerating a caller that already has an event loop.
 
@@ -142,4 +221,5 @@ def serve() -> None:
 # Called at module scope, not under `if __name__ == "__main__"`: CAI executes
 # this script rather than importing it, and a guard here would make an
 # Application that starts cleanly and serves nothing.
+_pick_port()
 serve()

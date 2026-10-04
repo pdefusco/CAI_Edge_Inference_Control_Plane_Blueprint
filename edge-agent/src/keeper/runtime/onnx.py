@@ -33,16 +33,32 @@ _PREFERRED_PROVIDERS = (
 
 
 class OnnxRuntime:
-    """Implements `ModelRuntime` over `onnxruntime.InferenceSession`."""
+    """Implements `ModelRuntime` over `onnxruntime.InferenceSession`.
 
-    def __init__(self) -> None:
-        try:
-            import onnxruntime  # noqa: PLC0415
-        except ImportError as exc:  # pragma: no cover - environment-dependent
-            raise ModelLoadError(
-                "onnxruntime is not installed; install keeper[onnx] or set KEEPER_RUNTIME=mock"
-            ) from exc
-        self._ort = onnxruntime
+    `ort` exists so this class can be tested without the wheel installed, which
+    until now it could not be: every line below the import was unreachable on a
+    laptop, so the first place this code ever ran was a Jetson over SSH.
+
+    A constructor parameter rather than patching `sys.modules["onnxruntime"]`,
+    for two reasons. It is what this repo does everywhere else -- dependencies
+    arrive through constructors, and `httpx.MockTransport` is the single
+    sanctioned exception. And a `sys.modules` entry is global: a fake left behind
+    by one test would be picked up by the tests that mean to exercise the *real*
+    wheel, which is a failure that only appears on machines that have it and only
+    in some test orders. A parameter cannot leak.
+    """
+
+    def __init__(self, ort: Any = None) -> None:
+        if ort is None:
+            try:
+                import onnxruntime  # noqa: PLC0415
+            except ImportError as exc:  # pragma: no cover - environment-dependent
+                raise ModelLoadError(
+                    "onnxruntime is not installed; install keeper[onnx] or set "
+                    "KEEPER_RUNTIME=mock"
+                ) from exc
+            ort = onnxruntime
+        self._ort = ort
         self._session: Any = None
         self._running = False
         self._model: tuple[str, str] | None = None

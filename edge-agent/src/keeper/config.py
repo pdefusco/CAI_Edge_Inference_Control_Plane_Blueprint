@@ -5,7 +5,14 @@ Env-var driven, because on the Jetson this runs as a systemd unit with an
 
 The device token is accepted from a *file* as well as an env var, and the file is
 the recommended form: an env var is visible in `/proc/<pid>/environ` and in
-`systemctl show`, while a `0600` file is not.
+`systemctl show`, while a file readable only by the service user is not.
+
+`0640 root:keeper` is the mode `deploy/keeper.service` installs, and the reason it
+is not `0600` is the unit's `User=keeper`: a 0600 root-owned file is unreadable by
+the process that needs it. The property this code cares about is "not
+world-readable", which that mode satisfies while staying readable by the group the
+agent runs in. Getting it wrong is an ordinary mistake, so it is reported as a
+`ConfigError` below rather than left to surface as a `PermissionError` traceback.
 """
 
 from __future__ import annotations
@@ -145,8 +152,40 @@ def load_settings(
     if not token and token_file:
         path = Path(token_file).expanduser()
         if not path.is_file():
-            raise ConfigError(f"KEEPER_TOKEN_FILE does not exist: {path}")
-        token = path.read_text().strip()
+            # `is_file()` swallows whatever OSError it hit and answers False, so
+            # this branch is not only "absent": a directory, a dangling symlink and
+            # a parent directory this user cannot traverse all land here too. The
+            # message says so rather than claiming the file does not exist, because
+            # `ls` as root would then contradict the journal.
+            raise ConfigError(
+                f"KEEPER_TOKEN_FILE is not a readable regular file: {path} -- it is "
+                "missing, not a file, or inside a directory this user cannot enter"
+            )
+        try:
+            token = path.read_text().strip()
+        except OSError as exc:
+            # The failure this exists for: a token file installed `0600 root:root`
+            # while the unit runs as `User=keeper`. `is_file()` passes -- it only
+            # stats -- and the read then raises `PermissionError`, which is *not* a
+            # `ConfigError` and so escaped `main.py`'s exit-2 handler as a
+            # traceback. An operator debugging a device over SSH got a stack trace
+            # for a chmod, and systemd restarted the unit forever because the exit
+            # code was 1 rather than the 2 `RestartPreventExitStatus` watches for.
+            raise ConfigError(
+                f"KEEPER_TOKEN_FILE cannot be read: {path} "
+                f"({exc.strerror or exc.__class__.__name__}). The unit runs as "
+                "User=keeper, so the file must be readable by that user -- install "
+                "it 0640 root:keeper, not 0600 root:root."
+            ) from exc
+        except UnicodeDecodeError as exc:
+            # A `ValueError`, not an `OSError`, so it needs its own branch to reach
+            # exit 2. Reached by copying the wrong thing into place -- a keyfile, an
+            # archive -- and the decode offset is the only safe detail to report:
+            # the bytes themselves are a credential.
+            raise ConfigError(
+                f"KEEPER_TOKEN_FILE is not text: {path} is not valid {exc.encoding} "
+                f"at byte {exc.start}"
+            ) from exc
     if not token:
         raise ConfigError("one of KEEPER_TOKEN or KEEPER_TOKEN_FILE is required")
 

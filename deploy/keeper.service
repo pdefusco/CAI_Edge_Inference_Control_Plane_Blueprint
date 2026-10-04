@@ -1,0 +1,127 @@
+#  Lighthouse edge agent, as a systemd unit. Installed by scripts/install_keeper.sh.
+#
+#  Every hardening directive below is either enabled with a reason or disabled with
+#  a reason. That is not pedantry: on this device the sandbox can take the GPU away
+#  without taking the service down, so the model loads, runs on the CPU, reports
+#  RUNNING, and the dashboard shows a healthy fleet that is quietly 30x slower than
+#  the hardware it was bought on. A unit that fails to start is a better outcome
+#  than that, and the directives that can cause the silent version are called out.
+#
+#  See docs/jetson-setup.md for the order to add the commented-out block in, and
+#  for the acceptance check after each addition: `hardware_info()` must still
+#  report a non-CPU execution provider.
+
+[Unit]
+Description=Lighthouse edge agent (keeper)
+# Cosmetic rather than load-bearing, and worth knowing which: the reconcile loop
+# survives a failed poll by design (main.py:8-11 -- an agent that dies on a bad
+# network makes a governance problem look like a connectivity problem), so without
+# this the agent would simply log one connection error at boot and recover. This
+# just keeps that error out of the journal.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# `exec` rather than `simple`, so a missing interpreter or an unreadable
+# EnvironmentFile is reported by `systemctl start` as a start failure instead of
+# being reported as started and then dying a millisecond later.
+Type=exec
+ExecStart=/opt/keeper/venv/bin/keeper
+
+User=keeper
+Group=keeper
+
+# The device token lives in a separate file from the rest of the configuration so
+# the two can have different modes and different rotation procedures. Both are
+# 0640 root:keeper -- readable by the service, not world-readable, not writable by
+# the service itself.
+EnvironmentFile=/etc/keeper/keeper.env
+
+# Creates and owns /var/lib/keeper, which is `AgentSettings.data_dir`'s default
+# (config.py) and holds the artifact cache, the unpacked models and state.json.
+# 0750: the state file names the device and its deployed versions, and nothing
+# outside the service needs to read it.
+StateDirectory=keeper
+StateDirectoryMode=0750
+
+Restart=always
+RestartSec=10
+# Exit 2 is "this device is configured wrong" -- a bad KEEPER_RUNTIME, an
+# unreadable token file, an onnxruntime that is not importable. Restarting cannot
+# fix any of them, and a device re-polling the control plane every 10 seconds
+# forever looks, from the dashboard, exactly like one with a flaky network rather
+# than one nobody finished installing. `config.py` and `main.py` both route
+# misconfiguration here deliberately; this line is the other half of that contract.
+RestartPreventExitStatus=2
+
+# == what the sandbox must NOT do ============================================
+#
+# PrivateDevices=yes is the single worst mistake available in this file. It
+# replaces /dev with a minimal private tree containing only the standard
+# pseudo-devices, which on a Jetson means /dev/nvhost-* and /dev/nvmap are simply
+# absent. onnxruntime then fails to initialise CUDA and falls back to the CPU
+# provider *silently and per-node*: the unit starts, the model loads, inference
+# works, and nothing anywhere reports an error. Set explicitly to `no` -- which is
+# also the default -- so that nobody adds it later from a hardening checklist
+# without reading this.
+PrivateDevices=no
+
+# Device access for a non-root user comes from group membership, not from this
+# unit: install_keeper.sh adds `keeper` to `video` (and `render`, where it exists),
+# because the Tegra device nodes are root:video on some L4T releases and 0666 on
+# others. If the agent reports only CPUExecutionProvider, `ls -l /dev/nvhost-ctrl`
+# and `id keeper` are the first two things to compare.
+
+# CUDA and TensorRT generate and cache code at runtime, which requires a mapping
+# that is both written and executed. MemoryDenyWriteExecute=yes breaks that, and
+# the symptom is a provider-initialisation failure rather than anything that names
+# this setting. Explicit for the same reason as PrivateDevices.
+MemoryDenyWriteExecute=no
+
+# NOT set: ProcSubset=pid. It would hide everything in /proc that is not a process
+# directory, including /proc/device-tree/model -- which `onnx.py`'s
+# `hardware_info()` reads to report what the device calls itself. The heartbeat
+# would lose the only field that identifies an Orin as an Orin.
+#
+# ProtectProc is the part of that pair which costs nothing here: it hides *other*
+# processes, which the agent never reads.
+ProtectProc=invisible
+
+# == what the sandbox should do ==============================================
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+# `strict`, not `yes` or `full`: the whole hierarchy is read-only except /dev,
+# /proc and /sys, so a writable path has to be granted deliberately. StateDirectory=
+# already grants /var/lib/keeper, which is the one tree the agent owns -- the
+# artifact cache, the unpacked models, state.json, and CUDA's JIT cache under the
+# account's $HOME. An operator who points KEEPER_DATA_DIR somewhere else gets a
+# read-only filesystem error, which is the correct and loud failure.
+ProtectSystem=strict
+# Safe only because the venv is in /opt. Installing it under /home/<user>, which is
+# the natural thing to do on a freshly flashed Jetson, makes ExecStart vanish.
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# == add these one at a time, re-checking the provider list after each =========
+#
+# Unverified on the device as of this commit, and each one is capable of removing
+# GPU access without removing the service. Uncomment in this order, and after each
+# `systemctl restart keeper` confirm the heartbeat still reports a non-CPU
+# provider -- `journalctl -u keeper | grep providers` or the fleet view.
+#
+# ProtectKernelTunables=yes      # the Tegra stack reads /sys; writes are what this blocks
+# ProtectKernelModules=yes       # nvidia modules load at boot, so this *should* be free
+# RestrictNamespaces=yes
+# RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# SystemCallFilter=@system-service
+# SystemCallArchitectures=native
+# CapabilityBoundingSet=          # the agent needs none; verify before trusting it
+# MemoryMax=2G                    # 8 GB shared with CUDA; a ceiling here is a real risk
+
+[Install]
+WantedBy=multi-user.target

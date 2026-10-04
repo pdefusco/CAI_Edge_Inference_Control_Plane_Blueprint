@@ -156,6 +156,64 @@ class TestToken:
         with pytest.raises(ConfigError, match="required"):
             load_settings({**broken, "KEEPER_TOKEN_FILE": str(path)})
 
+    def test_a_directory_is_not_reported_as_a_missing_file(self, tmp_path: Path) -> None:
+        """`is_file()` answers False for a directory as well as for an absent path,
+        so a message saying "does not exist" would be contradicted by the first `ls`
+        the operator ran."""
+        broken = env()
+        del broken["KEEPER_TOKEN"]
+        with pytest.raises(ConfigError) as caught:
+            load_settings({**broken, "KEEPER_TOKEN_FILE": str(tmp_path)})
+        assert "does not exist" not in str(caught.value)
+        assert "not a file" in str(caught.value)
+
+    def test_an_unreadable_token_file_is_a_config_error_not_a_permissionerror(
+        self, tmp_path: Path
+    ) -> None:
+        """The whole reason this branch exists.
+
+        `0600 root:root` under `User=keeper` is a mistake anyone makes once. It
+        passes `is_file()`, which only stats, and then `read_text()` raises
+        `PermissionError` -- a `ValueError`-side-of-the-house exception that is not a
+        `ConfigError`, so it escaped `main.py`'s handler, printed a traceback, and
+        exited 1. Exit 1 is not `RestartPreventExitStatus=2`, so systemd restarted
+        the device every `RestartSec` forever over a chmod.
+        """
+        path = tmp_path / "token"
+        path.write_text("lhd_unreadable.secret")
+        path.chmod(0o000)
+        if os.access(path, os.R_OK):  # pragma: no cover - root, or an exotic fs
+            pytest.skip("this user can read a 0000 file, so the failure cannot occur")
+        broken = env()
+        del broken["KEEPER_TOKEN"]
+        with pytest.raises(ConfigError) as caught:
+            load_settings({**broken, "KEEPER_TOKEN_FILE": str(path)})
+        message = str(caught.value)
+        assert "cannot be read" in message
+        # The remedy, not just the diagnosis: the journal line is the only place an
+        # operator looks, and "permission denied" alone does not say which mode is
+        # wanted or why 0600 is not it.
+        assert "0640 root:keeper" in message
+        assert "lhd_" not in message
+
+    def test_a_binary_token_file_is_refused_without_quoting_its_bytes(
+        self, tmp_path: Path
+    ) -> None:
+        """`UnicodeDecodeError` is a `ValueError`, so it needed its own branch to
+        reach exit 2 rather than a traceback. Reached by copying the wrong file into
+        place; the bytes stay out of the message because a credential is the most
+        likely thing to have been copied."""
+        path = tmp_path / "token"
+        path.write_bytes(b"lhd_\xff\xfe.secret")
+        broken = env()
+        del broken["KEEPER_TOKEN"]
+        with pytest.raises(ConfigError) as caught:
+            load_settings({**broken, "KEEPER_TOKEN_FILE": str(path)})
+        message = str(caught.value)
+        assert "not text" in message
+        assert "\xff" not in message
+        assert "lhd_" not in message
+
     def test_the_token_is_not_in_the_error_text_when_the_url_is_bad(self) -> None:
         """Errors from here are printed to stderr and land in the journal, which
         `main.py`'s redacting filter does not cover -- it filters log records, and

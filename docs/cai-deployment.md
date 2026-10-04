@@ -77,14 +77,60 @@ rather than changes it.
 
 ## 3. Create the Application
 
-Script: the `lighthouse` console script (`control-plane/pyproject.toml:52` →
-`lighthouse.main:run`). A one-line launcher is usually easier to point a CAI
-Application at than a console script on `PATH`:
+**Script: `app.py`**, at the repo root. It is committed, so there is nothing to
+paste — point the Application's script field at it. A launcher in the project is
+easier to point an Application at than the `lighthouse` console script
+(`control-plane/pyproject.toml:52` → `lighthouse.main:run`) on `PATH`.
 
-```python
-# app.py
-from lighthouse.main import run
-run()
+It does one thing before calling `run()`: it puts `contracts/src` and
+`control-plane/src` on `sys.path`, ahead of anything installed. That makes
+`lighthouse` and `lighthouse_contracts` importable with **no install at all**, and
+means the Application serves the project's current code rather than a copy
+installed weeks ago. Observed 2026-10-04: in an interpreter with neither
+`pydantic` nor `fastapi` present, all three of `lighthouse`,
+`lighthouse_contracts` and `lighthouse.main` resolve to the repo's own `src`
+trees.
+
+What the bootstrap cannot do is supply the third-party half — see
+**Dependencies** below. It is also a deliberate departure from how every other
+entry point in this repo finds the packages (`Makefile:49-53`,
+`scripts/_common.sh:32-43` both rely on an editable install), and `app.py` says
+so in a comment so nobody 'fixes' it back.
+
+**Runtime.** `control-plane/pyproject.toml:20` is `requires-python = ">=3.11"`,
+and that floor is load-bearing rather than aspirational: the comment above it
+records 3.10 being measured — 3 failures, one root cause, "Do not lower this
+floor." CAI runtimes ship a range of Pythons, so check the one you select *before*
+creating the Application, with `python3 -V` in a Session on that runtime. A 3.10
+runtime fails in ways that do not look like a version problem.
+
+**Dependencies.** The bootstrap covers the first-party packages and nothing else.
+These still have to be present in the Application container: `fastapi`,
+`uvicorn[standard]`, `jinja2`, `pydantic`, `pyyaml`, `python-multipart`
+(`control-plane/pyproject.toml:23-29`), plus `httpx` from the `cai` extra
+(`:42-44`) — required here, not optional, because `LIGHTHOUSE_REGISTRY` defaults
+to `cai` under `LIGHTHOUSE_ENV=cai`. The install that gets all of them:
+
+```
+pip install --user -e contracts -e 'control-plane[cai]'
+```
+
+`contracts` is a local path package pip cannot resolve from an index, which is why
+it is named explicitly. `cdp` also has to be on `PATH` for the default
+`registry_token_source=cli` (`registry/cai.py:190` names `pip install cdpcli`);
+that is §5's open question rather than a separate one.
+
+**Open question. Measure it; do not assume it.** Whether a `--user` install run in
+a Session reaches an *Application* container was not verified in this milestone.
+An Application gets a fresh container from the runtime image, so this turns on
+whether `--user` wrote into the project filesystem or into the image. The
+`sys.path` bootstrap removes the first-party half of that risk on purpose; it
+cannot remove the third-party half. If the Application dies on a
+`ModuleNotFoundError` for `fastapi` or `httpx`, this is why — check from inside
+the Application's own environment:
+
+```
+python3 -c 'import fastapi, httpx; print("ok")'
 ```
 
 **Port.** CAI sets `CDSW_APP_PORT` and routes the Application's public URL to it.
@@ -101,12 +147,50 @@ log reads like a successful boot right up to the error. Observed 2026-10-04. Whe
 you run it by hand in a Session:
 
 ```
-env -u CDSW_APP_PORT PORT=8900 lighthouse
+env -u CDSW_APP_PORT PORT=8900 python app.py
 ```
+
+Prefer `app.py` over the `lighthouse` console script here: the script only exists
+on `PATH` if the editable install happened, and `app.py` needs nothing more than
+the third-party dependencies.
 
 **Unauthenticated access.** If the Application is created with platform
 authentication *enabled*, CML puts Cloudera SSO in front of it and a bearer-token
 client gets a login page. See §6 — that is the measurement, not an assumption.
+
+**Write down which way you set that toggle.** §6's result cannot be read back
+without it: "SSO-gated" means one thing if you opted in and something entirely
+different if the platform imposed it on an Application you created with
+authentication off.
+
+### Where the URL comes from
+
+There is no URL until the Application exists. §6, §7 and
+`docs/jetson-setup.md:349` all write `<app-url>` as though you already had it;
+this is where you get it.
+
+The address is the **subdomain** — a field you fill in when creating the
+Application — joined to the **workbench domain**. The workbench domain is in
+every Session's environment:
+
+```
+echo $CDSW_DOMAIN
+```
+
+`scripts/probe_registry.py:630` already prints it among the Session variables it
+reports, so you may have seen it there.
+
+**Copy the URL from the project's Applications list rather than assembling it by
+hand.** That list is the authoritative value; the two-part shape above is what to
+confirm against it, not a fact to lean on. And do not reuse the registry host
+here — `probe_registry.py:645-646` notes the registry lives on a *different* host
+from `$CDSW_DOMAIN`, which is correct for the registry and wrong for the
+Application. Conflating the two is the easy mistake.
+
+A hostname identifies a tenant and this repo is public, so keep it out of
+anything you commit. `probe_app.py` masks the app host to `<app-host>` unless you
+pass `--show-host` (`probe_app.py:106-111`), which is what makes its output safe
+to paste into a note or an issue.
 
 ---
 
@@ -182,6 +266,9 @@ the agent receives an HTML login page where it expects JSON.
 ```
 python scripts/probe_app.py --url https://<app-url>
 ```
+
+If you do not have `<app-url>` yet, §3's *Where the URL comes from* says where it
+comes from and why you should copy it rather than assemble it.
 
 Run it **twice**: once from a CAI Session inside the workbench (the baseline — if
 it fails there, the app is broken, not the ingress), and once from a laptop with

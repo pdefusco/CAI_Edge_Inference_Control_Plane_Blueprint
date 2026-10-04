@@ -3,6 +3,13 @@
 .dev/
 *.token
 
+# The same database, at the *default* `data_dir` (`config.py:54` -- `./.lighthouse`,
+# relative to the working directory). `make dev` never lands here because
+# `scripts/dev.sh` points at `.dev/`, but running `python app.py` or `lighthouse`
+# from the repo root does, which `docs/cai-deployment.md` §3 now tells you to do
+# when checking the entry point by hand.
+.lighthouse/
+
 # `.env.example` tells you to copy it to `.env` and fill in the admin token and
 # the registry domain. This repo is public and that domain is a tenant
 # identifier, so the copy must never be committable. `.env.example` itself is

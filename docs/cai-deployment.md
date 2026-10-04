@@ -196,26 +196,45 @@ breakage, because both variables are set either way — a plain-process
 Application would then bind a port nothing routes to and look perfectly healthy
 while being unreachable.
 
-**Open question. Measure it; do not assume it.** The fallback did not help here,
-and the reason rules out the obvious explanation: in this tenant
-`CDSW_APP_PORT` and `CDSW_READONLY_PORT` are **the same port** (8100), and it was
-already in use before the process started. Observed 2026-10-04. So the
-difference between this deployment and the sibling blueprint's working one is
-*not* which variable it binds — something in this Application container holds
-the routed port and does not hold it there. What that something is decides the
-fix, and the two possibilities need opposite responses:
+**The fallback did not help, and the reason is worth knowing.** In this tenant
+`CDSW_APP_PORT` and `CDSW_READONLY_PORT` are **the same port** (8100), so there
+was no second port to fall back to — the difference from the sibling
+blueprint's working deployment is *not* which variable gets bound. Observed
+2026-10-04. `app.py` then read `/proc` and named the holder:
 
-* **an earlier instance of this app** — stop the Application completely and
-  start it again, rather than restarting it;
-* **part of the engine** — then this Application *kind* cannot host a server on
-  the routed port at all, and the answer is at creation time, not in the code.
-  Compare the runtime and editor selection against an Application known to serve
-  (the sibling blueprint's) and match it.
+```
+port 8100 is held by pid 1 (/var/lib/cdsw/deps/engine-init /var/lib/cdsw/deps/jupyter-wsg-launcher)
+```
 
-`app.py` reports which on the failure path: it reads `/proc` to name the pid and
-command line holding the port, because `ss` and `netstat` have both shown
-nothing for this class of conflict inside a CAI container. Read that stderr line
-before changing anything.
+Observed 2026-10-04. **Pid 1 is the engine**, running a Jupyter
+workspace-gateway launcher. That is not a leftover instance of ours, so stopping
+and starting the Application does not free it, and no change to `app.py` can
+take it from the engine. An Application that runs this way cannot host a server
+on the port CAI routes to.
+
+The fix is therefore at creation time, and two things are worth checking, in
+this order:
+
+* **The Application's own environment variables.** In CML these two ports are
+  normally *different*, which is exactly why the sibling blueprint's
+  `--port $CDSW_READONLY_PORT` works there and is a no-op here. If either
+  variable is set by hand on the Application, remove it: the engine sets both,
+  and overriding one aims the server at the engine's own Jupyter port.
+  **Open question. Measure it; do not assume it.** What has been observed is
+  only that both read 8100 inside the container. Whether that is because they
+  were set by hand here, or because this runtime kind reports one port for both,
+  has not been read off the Application's configuration yet.
+* **The runtime and editor selected for the Application.** A
+  `jupyter-wsg-launcher` on the routed port is an editor serving JupyterLab
+  there — the same kernel-style execution that leaves `__file__` undefined and
+  keeps a live event loop, two paragraphs up. Compare the selection against an
+  Application known to serve a web app in the same workspace, and match it.
+
+`app.py` prints what both checks need, on the failure path only: the holder's
+pid and command line, every `*PORT*` variable in the environment, and every port
+listening in the container with its owner. Read those before changing anything.
+Non-port `CDSW_*` variables are deliberately left out of that dump — they carry
+the workbench domain and CRNs, and this repo is public.
 
 **Set neither port variable yourself**, and leave `LIGHTHOUSE_HOST` unset too:
 `main.py:298` already binds `0.0.0.0` whenever the env is not `local`, which a

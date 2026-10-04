@@ -96,6 +96,59 @@ for _pkg in _PACKAGES:
 from lighthouse.main import run
 
 
+def _listening(proc: Path) -> dict[int, set[str]]:
+    """Every port in TCP_LISTEN in this container, mapped to its socket inodes.
+
+    Reads `/proc/net/tcp{,6}` directly because `ss` and `netstat` have both
+    shown nothing for this class of conflict inside a CAI container
+    (`main.py:286-295`).
+    """
+    ports: dict[int, set[str]] = {}
+    for name in ("net/tcp", "net/tcp6"):
+        try:
+            lines = (proc / name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            # Field 3 is the state; 0x0A is TCP_LISTEN. A *connected* socket on
+            # a port is a client of someone else's and not what blocks a bind.
+            if len(fields) <= 9 or fields[3] != "0A":
+                continue
+            try:
+                port = int(fields[1].rsplit(":", 1)[-1], 16)
+            except ValueError:
+                continue
+            ports.setdefault(port, set()).add(fields[9])
+    return ports
+
+
+def _owner(inodes: set[str], proc: Path) -> str:
+    """`pid N (cmdline)` for whichever visible process holds one of `inodes`."""
+    if not inodes:
+        return ""
+    for entry in sorted(proc.iterdir()):
+        if not entry.name.isdigit():
+            continue
+        try:
+            fds = list((entry / "fd").iterdir())
+        except OSError:
+            continue  # Someone else's process, or it just exited.
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if not (target.startswith("socket:[") and target[8:-1] in inodes):
+                continue
+            try:
+                cmd = (entry / "cmdline").read_text().replace("\0", " ").strip()
+            except OSError:
+                cmd = ""
+            return f"pid {entry.name}" + (f" ({cmd[:160]})" if cmd else "")
+    return "a process outside this container's view"
+
+
 def _port_holder(port: int, *, proc: Path = Path("/proc")) -> str:
     """Best-effort description of the process already listening on `port`.
 
@@ -105,52 +158,49 @@ def _port_holder(port: int, *, proc: Path = Path("/proc")) -> str:
     Application runs), and those have completely different fixes. Observed
     2026-10-04 in a deployed Application, where `CDSW_APP_PORT` and
     `CDSW_READONLY_PORT` were *the same port* and both were taken, so there was
-    no fallback left and no way to tell the two causes apart from the log.
+    no fallback left and no way to tell the two causes apart from the log. The
+    answer that line gave -- `pid 1 (... engine-init ... jupyter-wsg-launcher)`
+    -- is what `docs/cai-deployment.md` §3 now records.
 
-    Reads `/proc` directly because `ss` and `netstat` have both shown nothing
-    for this class of conflict inside a CAI container (`main.py:286-295`).
     Returns "" when it cannot tell, and must never raise: a diagnostic that
     replaces the real error with its own traceback is worse than no diagnostic.
     """
     try:
-        wanted = f"{port:04X}"
-        inodes = set()
-        for name in ("net/tcp", "net/tcp6"):
-            try:
-                lines = (proc / name).read_text().splitlines()[1:]
-            except OSError:
-                continue
-            for line in lines:
-                fields = line.split()
-                # 0x0A is TCP_LISTEN; a connected socket on this port is a
-                # client of someone else's and not what is blocking the bind.
-                if len(fields) > 9 and fields[1].rsplit(":", 1)[-1] == wanted and fields[3] == "0A":
-                    inodes.add(fields[9])
-        if not inodes:
-            return ""
-
-        for entry in sorted(proc.iterdir()):
-            if not entry.name.isdigit():
-                continue
-            try:
-                fds = list((entry / "fd").iterdir())
-            except OSError:
-                continue  # Someone else's process, or it just exited.
-            for fd in fds:
-                try:
-                    target = os.readlink(fd)
-                except OSError:
-                    continue
-                if not (target.startswith("socket:[") and target[8:-1] in inodes):
-                    continue
-                try:
-                    cmd = (entry / "cmdline").read_text().replace("\0", " ").strip()
-                except OSError:
-                    cmd = ""
-                return f"held by pid {entry.name}" + (f" ({cmd[:160]})" if cmd else "")
-        return "held by a process outside this container's view"
+        holder = _owner(_listening(proc).get(port, set()), proc)
+        return f"held by {holder}" if holder else ""
     except Exception:  # noqa: BLE001 -- never let the diagnostic mask the error
         return ""
+
+
+def _port_report(*, proc: Path = Path("/proc")) -> list[str]:
+    """What CAI offered and what is already listening, as indented lines.
+
+    Printed alongside the bind failure because the two causes §3 distinguishes
+    are told apart by exactly this: which ports CAI *named*, and whether any of
+    them is free. Only variables whose name contains `PORT` are shown -- the
+    rest of `CDSW_*` carries the workbench domain and CRNs, which identify a
+    tenant and have no business in a log someone will paste into an issue
+    (`[[lighthouse-repo-is-public]]`).
+    """
+    lines: list[str] = []
+    try:
+        offered = sorted(
+            (name, value) for name, value in os.environ.items() if "PORT" in name
+        )
+        if offered:
+            lines.append(
+                "  ports in the environment: "
+                + " ".join(f"{name}={value}" for name, value in offered)
+            )
+        table = _listening(proc)
+        if table:
+            lines.append("  listening in this container:")
+            for port in sorted(table):
+                owner = _owner(table[port], proc) or "owner unknown"
+                lines.append(f"    {port} -- {owner}")
+    except Exception:  # noqa: BLE001 -- a diagnostic must not mask the error
+        return lines
+    return lines
 
 
 def _pick_port() -> None:
@@ -164,10 +214,17 @@ def _pick_port() -> None:
         ('0.0.0.0', 8100): address already in use
 
     *after* logging `Application startup complete`, so the log reads as a
-    healthy boot. Observed 2026-10-04 in a deployed Application. The public URL
-    for that kind of Application is proxied off `CDSW_READONLY_PORT` instead --
-    the pattern a sibling blueprint (`CAI_Agentic_NBA_Observability_Blueprint`,
-    `launch_app.py`) has deployed successfully.
+    healthy boot. Observed 2026-10-04 in a deployed Application, where
+    `_port_holder` named the holder as **pid 1**, the engine's own
+    `jupyter-wsg-launcher`.
+
+    The fallback to `CDSW_READONLY_PORT` comes from a sibling blueprint
+    (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`), which serves a
+    FastAPI app from a CAI Application by binding `$CDSW_READONLY_PORT`. It
+    cannot help when the two variables name the *same* port, which is what was
+    observed here -- both were 8100. The probe stays anyway: it is still the
+    only thing that tells the two runtime kinds apart, and it costs one bind.
+    See `docs/cai-deployment.md` §3 for what to change instead.
 
     Hardcoding the read-only port would just move the breakage: both variables
     are set either way, so a plain-process Application would then bind a port
@@ -231,11 +288,14 @@ def _pick_port() -> None:
             holder = _port_holder(failed)
             if holder:
                 lines.append(f"  port {failed} is {holder}")
+        lines.extend(_port_report())
         lines.append(
-            "  If that is an earlier instance of this app, stop the Application"
-            " fully and start it again rather than restarting it. If it is part"
-            " of the engine, this Application kind cannot host a server on the"
-            " routed port -- see `docs/cai-deployment.md` §3."
+            "  If the holder is an earlier instance of this app, stop the"
+            " Application fully and start it again rather than restarting it."
+            " If it is the engine -- pid 1, or a command line naming"
+            " `engine-init`, `jupyter` or `workbench` -- then no change to this"
+            " script can win that port, and the fix is at creation time."
+            " See `docs/cai-deployment.md` §3."
         )
         print("\n".join(lines), file=sys.stderr)
 

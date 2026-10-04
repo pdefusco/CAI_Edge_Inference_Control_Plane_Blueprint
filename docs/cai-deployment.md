@@ -237,9 +237,15 @@ may describe a sibling workload — which is sound, because the port scheme
 belongs to the CAI runtime rather than to one workload, and the bind still
 decides. When the winner comes from there, `app.py` says so on stderr, because
 this is the candidate that can be wrong in the quiet direction: a port CAI does
-not route to yields an app that looks healthy and answers nobody. **Open
-question. Measure it; do not assume it** — that 8090 is bindable has been
-observed, that the public URL *reaches* it has not. §6's probe is that check.
+not route to yields an app that looks healthy and answers nobody.
+
+Observed 2026-10-04: with that third candidate in place the Application bound
+8090 and logged `Uvicorn running on http://0.0.0.0:8090`. Note where the value
+came from — a **sibling** workload's `SERVICE_PORT_APP`, because this workload
+exposes no app service port of its own. **Open question. Measure it; do not
+assume it.** That 8090 was free and bindable is observed. That the public URL
+routes to 8090 is not, and the sibling provenance is exactly the reason to doubt
+it. §6's probe is that check, and it is the first thing to run.
 
 **If the public URL does not reach it, the port variables are overridden.**
 Three `CDSW_*` port variables collapsed onto one value is the signature. Look in
@@ -261,6 +267,22 @@ non-numeric values are excluded because service discovery sets
 `<SERVICE>_PORT=tcp://172.x.y.z:8100` and `..._TCP_ADDR=172.x.y.z` for every
 service in the namespace — a name filter alone prints the cluster's internal
 addressing into a log someone pastes into an issue. This repo is public.
+
+**A working start looks like a hang, and that is correct.** The last line you
+should see is
+
+```
+INFO uvicorn.error: Uvicorn running on http://0.0.0.0:8090 (Press CTRL+C to quit)
+```
+
+and then nothing, forever. Under the kernel the script is a cell that never
+finishes, with no prompt returning and no further output — indistinguishable at a
+glance from a stall. It has to be that way: `serve()` joins a **non-daemon**
+thread so the process outlives the script, because a script that returns is a
+script CAI treats as finished, and it takes the Application down with it.
+Observed 2026-10-04: the Application reached this state on 8090 after the three
+failures above. Do not "fix" the hang. The next thing to check is the URL, not
+the log.
 
 **Set neither port variable yourself**, and leave `LIGHTHOUSE_HOST` unset too:
 `main.py:298` already binds `0.0.0.0` whenever the env is not `local`, which a

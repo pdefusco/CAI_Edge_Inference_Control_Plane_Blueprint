@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Build the smallest ONNX graph the edge can actually run, and prove it locally.
+"""Build the ONNX graphs this project runs on, and prove them locally.
 
-M3 needs *a* model in the Cloudera AI AI Registry so the adapter's three
-fail-safe guesses can be checked against reality. It does not need a good
-model. This builds a hand-written graph -- one `MatMul`, one `Add`, a 1x4
-float32 input and a 1x2 float32 output, a few kilobytes -- with no training,
-no torch, and deliberately no demo story. A real model is M4's problem, when
-there is hardware to run it on.
+Two graphs, for two different jobs:
 
-`register_model.py` imports `build_minimal_onnx` and
-`build_mlflow_tar_gz` from here. This half is separate because it runs on a
+**`build_minimal_onnx`** -- one `MatMul`, one `Add`, a 1x4 float32 input and a
+1x2 float32 output. M3 needed *a* model in the Cloudera AI AI Registry so the
+adapter's three fail-safe guesses could be checked against reality; it did not
+need a good model. `register_model.py` imports this one.
+
+**`build_fashion_onnx`** -- `Conv` + `Relu` + `GlobalAveragePool` + `Flatten` +
+`MatMul` + `Add`, a dynamic batch of 1x28x28 images in and ten logits out.
+Added in M4 to replace the test fixtures' unloadable `model.onnx`, which was
+chained SHA-256 that onnxruntime rejects outright. Still untrained -- neither
+graph has an accuracy story, and this file will not grow one.
+
+This half of the work is separate from `register_model.py` because it runs on a
 laptop with no tenant, which makes it the only part that can be iterated on
-quickly -- and because M4 wants the same graph builder for `fake.py`'s ONNX
-fixture.
+quickly.
 
     pip install onnx                 # required
-    pip install onnxruntime numpy    # optional, enables the load check
+    pip install onnxruntime numpy    # optional, enables the load checks
 
 `onnx` is deliberately in **no** `pyproject.toml`, the same way
 `probe_registry.py` needs `cdpcli` and says so here rather than in a
@@ -27,10 +31,12 @@ Usage:
     python scripts/build_model.py                 # write the .onnx and the .tar.gz
     python scripts/build_model.py --self-check    # ...then validate them
     python scripts/build_model.py --self-check --quiet
+    python scripts/build_model.py --emit-fixture  # the base64 constant, nothing else
 
 Outputs land in `.dev/m3/`, which is gitignored at the directory level --
 `.gitignore` covers `*.onnx` but not `model.tar.gz`, so the directory is what
-keeps both out of a public repo.
+keeps both out of a public repo. The fixture graph is never written as a file
+for that same reason; see the note above `fixture_base64`.
 
 ## What `--self-check` actually checks
 
@@ -46,23 +52,30 @@ restating their rules, so it fails when they change:
   5. at least one `*.onnx` in the tree        `ArtifactManager._resolve_entrypoint`
   6. no symlinks, absolute paths or `..`      `keeper._safe_extract`
   7. the `.onnx` bytes genuinely load         `onnxruntime.InferenceSession`
-  8. a single declared input                  `runtime/onnx.py` reads inputs[0]
+  8. exactly one declared input               `runtime/onnx.py:_input_name`
 
 1 and 2 are properties of the registry, not of these bytes, so only a real
 registration settles them -- that is what `register_model.py` is for.
 
+It also checks the fixture graph, and that the base64 copies of it embedded in
+`registry/fake.py` and `edge-agent/tests/conftest.py` still equal what
+`build_fashion_onnx` produces. Nobody reviews 15 lines of base64; the check is
+there so nothing has to.
+
 This is a script mode and **not a pytest test**, on purpose: a test would put
-`onnx` on the default `make test` path, and the 387 + 78 suite has to stay
-runnable with no cloud and no ML dependency. The check still runs before
-anyone touches the tenant, which is the point of having it.
+`onnx` on the default `make test` path, and that suite has to stay runnable
+with no cloud and no ML dependency. The check still runs before anyone touches
+the tenant, which is the point of having it.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import hashlib
 import io
+import re
 import sys
 import tarfile
 import tempfile
@@ -79,6 +92,20 @@ OUTPUT_NAME = "output"
 INPUT_SHAPE = (1, 4)
 OUTPUT_SHAPE = (1, 2)
 
+# The *fixture* graph is a second, larger model with the same input and output
+# names -- see `build_fashion_onnx`. It exists for the test suite rather than
+# for the registry, and its shapes are the ones `registry/fake.py` has always
+# claimed in its MLmodel signature.
+FIXTURE_MODEL_NAME = "fashion-cnn"
+FIXTURE_INPUT_SHAPE: tuple[str | int, ...] = ("N", 1, 28, 28)
+FIXTURE_OUTPUT_SHAPE: tuple[str | int, ...] = ("N", 10)
+_FIXTURE_CHANNELS = 8
+_FIXTURE_CLASSES = 10
+# Changing this string changes the fixture bytes, which changes the digest two
+# files have embedded. It is versioned for that reason: a future `/v2` is an
+# intentional act with a visible diff, not an accident.
+_FIXTURE_SEED = b"lighthouse-fashion-cnn/v1"
+
 # Pinned, not defaulted, and both for the same reason: the Jetson runs whatever
 # `onnxruntime` wheel NVIDIA ships for aarch64, which is older than the `onnx`
 # on this laptop. A current `onnx` emits IR version 10 or 11, and an
@@ -86,8 +113,16 @@ OUTPUT_SHAPE = (1, 2)
 # that would surface on the device, after a successful registration and a
 # successful download, which is the worst possible place to find it.
 #
-# Opset 13 covers MatMul and Add with room to spare and has been supported for
-# years. IR version 9 is the newest that onnxruntime 1.17 accepts.
+# Opset 13 covers every op used here with room to spare and has been supported
+# for years. IR version 9 is the newest that onnxruntime 1.17 accepts.
+#
+# **The pin costs nothing on a newer runtime, measured rather than assumed.**
+# On 2026-10-04 both graphs below were re-stamped as IR 3, 9, 10, 11 and 12 and
+# handed to onnxruntime 1.30.0 (with onnx 1.23.1): all ten loaded and ran. So
+# IR 9 is forward-compatible, and a Jetson that turns out to have a current
+# onnxruntime is **not** a reason to raise these numbers -- it only means the
+# `onnxruntime>=1.17` floor has room. Raising them would buy nothing and would
+# re-expose the one failure mode that only appears on the device.
 OPSET = 13
 IR_VERSION = 9
 
@@ -111,7 +146,7 @@ def build_minimal_onnx() -> bytes:
     `W` and `b` are initializers with hand-written values rather than anything
     random, so two runs of this function produce identical bytes.
     """
-    from onnx import TensorProto, helper, numpy_helper
+    from onnx import TensorProto, helper
 
     # Written out literally. The values mean nothing; being *fixed* is the
     # entire requirement.
@@ -135,9 +170,10 @@ def build_minimal_onnx() -> bytes:
         ],
         name="smoke_test",
         inputs=[
-            # The single declared input (requirement 8). `runtime/onnx.py`
-            # reads `inputs[0].name` and nothing else, so a second input here
-            # would be silently ignored at the edge.
+            # The single declared input (requirement 8). `runtime/onnx.py` keys
+            # a bare tensor by the one declared name and refuses outright if
+            # there is not exactly one, so a second input here would take the
+            # edge from "works" to "cannot predict".
             helper.make_tensor_value_info(INPUT_NAME, TensorProto.FLOAT, list(INPUT_SHAPE))
         ],
         outputs=[
@@ -165,21 +201,221 @@ def build_minimal_onnx() -> bytes:
 
 
 def _float_tensor(name: str, rows: list[list[float]]):
-    """A float32 initializer built without numpy.
+    """A 2-D float32 initializer built without numpy."""
+    flat = [v for row in rows for v in row]
+    return _flat_tensor(name, (len(rows), len(rows[0])), flat)
+
+
+def _flat_tensor(name: str, dims: tuple[int, ...], vals: list[float]):
+    """A float32 initializer of any rank, built without numpy.
 
     numpy is `onnxruntime`'s dependency, not `onnx`'s, and the build half of
     this script must work with `onnx` alone -- requiring numpy to *produce* the
-    model would make the optional load check mandatory.
+    model would make the optional load check mandatory. That constraint is why
+    the fixture's weights are hashed into existence below instead of being
+    drawn from `numpy.random`.
     """
     from onnx import TensorProto, helper
 
-    flat = [float(v) for row in rows for v in row]
+    expected = 1
+    for d in dims:
+        expected *= d
+    if len(vals) != expected:
+        raise ValueError(f"{name}: {len(vals)} values for dims {dims} (want {expected})")
     return helper.make_tensor(
         name=name,
         data_type=TensorProto.FLOAT,
-        dims=[len(rows), len(rows[0])],
-        vals=flat,
+        dims=list(dims),
+        vals=[float(v) for v in vals],
     )
+
+
+# --------------------------------------------------------------------------
+# the fixture graph
+# --------------------------------------------------------------------------
+
+
+def _deterministic_floats(count: int, *, seed: bytes, scale: float = 0.05) -> list[float]:
+    """`count` floats in (-scale, scale), from a chained SHA-256 stream.
+
+    The same construction `registry/fake.py:_deterministic_payload` uses for
+    artifact bytes, carried one step further: each 16-bit slice of the digest is
+    read as a signed int16 and scaled into a small symmetric range, so the
+    initializers look like weights rather than like noise and `Relu` has
+    something to clip. Two bytes per value, not four, because an int16 maps onto
+    a float32 exactly -- no rounding to argue about across architectures.
+
+    Chained (each digest hashes the previous one) rather than counter-based, so
+    the stream cannot accidentally repeat, and seeded per tensor so the Conv
+    kernel and the classifier are not the same numbers twice.
+
+    `round(..., 6)` is the one thing here that is load-bearing for determinism
+    *across Python builds*: it makes the decimal values written into the
+    protobuf short and exact, instead of depending on repr of a full-precision
+    quotient.
+    """
+    out: list[float] = []
+    block = seed
+    while len(out) < count:
+        block = hashlib.sha256(block).digest()
+        for i in range(0, len(block), 2):
+            if len(out) == count:
+                break
+            raw = int.from_bytes(block[i : i + 2], "big", signed=True)
+            out.append(round(raw * scale / 32768, 6))
+    return out
+
+
+def build_fashion_onnx() -> bytes:
+    """A serialized ONNX model shaped like a Fashion-MNIST classifier.
+
+    `Conv(8,1,3,3)` -> `Relu` -> `GlobalAveragePool` -> `Flatten` ->
+    `MatMul(8x10)` -> `Add`: a dynamic batch of 1x28x28 images in, ten logits
+    out, about a kilobyte of weights. Untrained and never claimed otherwise --
+    the outputs are meaningless. What it is for is making the *plumbing* honest:
+
+    * `registry/fake.py` already declares a Fashion-MNIST signature in the
+      MLmodel it synthesizes, while its `model.onnx` member is chained SHA-256
+      that onnxruntime rejects with `INVALID_PROTOBUF`. These bytes make that
+      declaration true without editing it.
+    * `Conv` is the reason the graph is not just a pool and a MatMul. It is the
+      op `CUDAExecutionProvider` and `TensorrtExecutionProvider` actually claim
+      nodes for, so a device loading this fixture exercises its accelerator --
+      the fixture doubles as the GPU smoke test the M4 acceptance gate needs.
+    * `GlobalAveragePool` is why it is a kilobyte and not 31 KB. A real dense
+      `784x10` head would be 440 lines of base64, and the constant has to be
+      *duplicated* into the edge-agent test tree (that tree may not import
+      `lighthouse`), so a bigger weight matrix costs 880 lines of diff for
+      nothing.
+
+    The batch dimension is the symbol `N`, not a fixed 1, because the fixture is
+    loaded by tests that have no reason to agree on a batch size.
+    """
+    from onnx import TensorProto, helper
+
+    c, k = _FIXTURE_CHANNELS, _FIXTURE_CLASSES
+    initializers = [
+        _flat_tensor(
+            "conv_w", (c, 1, 3, 3), _deterministic_floats(c * 9, seed=_FIXTURE_SEED + b"/conv_w")
+        ),
+        _flat_tensor("conv_b", (c,), _deterministic_floats(c, seed=_FIXTURE_SEED + b"/conv_b")),
+        _flat_tensor("fc_w", (c, k), _deterministic_floats(c * k, seed=_FIXTURE_SEED + b"/fc_w")),
+        # 1xk rather than k, for the same reason `build_minimal_onnx` uses 1x2:
+        # it broadcasts against the MatMul result without depending on
+        # opset-dependent unidirectional broadcasting.
+        _flat_tensor("fc_b", (1, k), _deterministic_floats(k, seed=_FIXTURE_SEED + b"/fc_b")),
+    ]
+
+    graph = helper.make_graph(
+        nodes=[
+            helper.make_node(
+                "Conv",
+                [INPUT_NAME, "conv_w", "conv_b"],
+                ["conv_out"],
+                name="conv",
+                kernel_shape=[3, 3],
+                # Spelled out rather than defaulted. An older onnxruntime that
+                # disagreed about an implicit default would fail on the device,
+                # and `pads` in particular decides the output shape.
+                pads=[1, 1, 1, 1],
+                strides=[1, 1],
+                dilations=[1, 1],
+                group=1,
+            ),
+            helper.make_node("Relu", ["conv_out"], ["relu_out"], name="relu"),
+            helper.make_node("GlobalAveragePool", ["relu_out"], ["pooled"], name="pool"),
+            helper.make_node("Flatten", ["pooled"], ["features"], name="flatten", axis=1),
+            helper.make_node("MatMul", ["features", "fc_w"], ["logits"], name="matmul"),
+            helper.make_node("Add", ["logits", "fc_b"], [OUTPUT_NAME], name="add"),
+        ],
+        name="fashion_cnn",
+        # One declared input, like the minimal graph: `runtime/onnx.py` refuses
+        # to key a bare tensor for a graph with zero or several.
+        inputs=[
+            helper.make_tensor_value_info(
+                INPUT_NAME, TensorProto.FLOAT, list(FIXTURE_INPUT_SHAPE)
+            )
+        ],
+        outputs=[
+            helper.make_tensor_value_info(
+                OUTPUT_NAME, TensorProto.FLOAT, list(FIXTURE_OUTPUT_SHAPE)
+            )
+        ],
+        initializer=initializers,
+    )
+
+    model = helper.make_model(
+        graph,
+        producer_name=_PRODUCER,
+        producer_version="1",
+        opset_imports=[helper.make_operatorsetid("", OPSET)],
+    )
+    model.ir_version = IR_VERSION
+
+    import onnx
+
+    onnx.checker.check_model(model, full_check=True)
+    return model.SerializeToString()
+
+
+# --------------------------------------------------------------------------
+# shipping the fixture as source
+# --------------------------------------------------------------------------
+#
+# As a base64 constant and **not** as a `.onnx` file next to `fake.py`.
+# `.gitignore` contains `*.onnx`, so a committed binary fixture would be
+# silently excluded: present for whoever generated it, missing for everyone who
+# clones. `git add -f` would work and would last exactly until the next person
+# regenerated it. Base64 in a `.py` cannot be ignored by accident, diffs
+# visibly, and -- being in two files that may not import each other -- is held
+# in sync by `--self-check` below rather than by hope.
+
+_FIXTURE_WIDTH = 76
+
+
+def fixture_base64(onnx_bytes: bytes) -> str:
+    """The fixture bytes as wrapped base64, one chunk per line."""
+    packed = base64.b64encode(onnx_bytes).decode("ascii")
+    return "\n".join(packed[i : i + _FIXTURE_WIDTH] for i in range(0, len(packed), _FIXTURE_WIDTH))
+
+
+def emit_fixture(onnx_bytes: bytes) -> str:
+    """A paste-ready Python assignment for the two files that embed the fixture."""
+    body = "\n".join(f'    "{line}"' for line in fixture_base64(onnx_bytes).splitlines())
+    digest = hashlib.sha256(onnx_bytes).hexdigest()
+    return (
+        f"# Generated by `python scripts/build_model.py --emit-fixture`. Do not hand-edit:\n"
+        f"# `--self-check` compares this constant against the builder's output and fails\n"
+        f"# if they have drifted. {len(onnx_bytes)} bytes, sha256 {digest[:16]}...\n"
+        f"FASHION_ONNX_BASE64 = (\n{body}\n)\n"
+    )
+
+
+# The two places the constant has to live. `fake.py` is the control plane's
+# fixture source; `conftest.py` is the edge-agent's, and it cannot import the
+# first because `edge-agent/tests/conftest.py` exists partly to prove the agent
+# never depends on `lighthouse`. Duplication is the price of that boundary, so
+# the drift check is what makes it safe.
+_FIXTURE_SITES = (
+    _REPO / "control-plane" / "src" / "lighthouse" / "registry" / "fake.py",
+    _REPO / "edge-agent" / "tests" / "conftest.py",
+)
+
+
+def _embedded_fixture(path: Path) -> str | None:
+    """The `FASHION_ONNX_BASE64` literal in `path`, whitespace removed.
+
+    Read as *text*, not imported, for both sites. Importing `fake.py` would
+    prove only that some module-level name decodes; reading the file proves the
+    bytes are actually written down in the file that ships. And the edge-agent
+    copy lives in a conftest, which is not importable as a module at all.
+    """
+    if not path.is_file():
+        return None
+    match = re.search(r"^FASHION_ONNX_BASE64\s*=\s*\(([^)]*)\)", path.read_text(), re.M | re.S)
+    if match is None:
+        return None
+    return "".join(re.findall(r'"([^"]*)"', match.group(1)))
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +524,96 @@ def _skip(label: str, why: str) -> None:
     print(f"  skip  {label} -- {why}")
 
 
+def check_fixture() -> list[str]:
+    """Validate the fixture graph and the two source copies of its base64.
+
+    The drift assertion is the reason this exists. A base64 constant in a `.py`
+    is invisible in review -- nobody reads 15 lines of base64 and nobody would
+    notice if the builder below it started producing something else. So the
+    relationship is checked rather than trusted: if the graph changes and the
+    constants are not regenerated, this fails and names the command to run.
+
+    Returns the requirements that could not be checked here.
+    """
+    skipped: list[str] = []
+    fixture_bytes = build_fashion_onnx()
+
+    if build_fashion_onnx() != fixture_bytes:
+        raise CheckFailed("build_fashion_onnx() is not byte-reproducible across calls")
+    _ok(
+        "fixture graph builds reproducibly",
+        f"{len(fixture_bytes)} bytes, {len(fixture_base64(fixture_bytes).splitlines())} "
+        "lines of base64",
+    )
+
+    expected = base64.b64encode(fixture_bytes).decode("ascii")
+    for path in _FIXTURE_SITES:
+        # Repo-relative for the same reason the write lines are: an absolute
+        # path in pasted output is a small environment leak in a public repo.
+        where = path.relative_to(_REPO) if path.is_relative_to(_REPO) else path.name
+        embedded = _embedded_fixture(path)
+        if embedded is None:
+            # Not a failure *yet*: this check lands one commit before the two
+            # constants do, deliberately, so that the commit which adds them
+            # is already guarded when it is written.
+            skipped.append(f"the embedded fixture in {where} (no FASHION_ONNX_BASE64 there yet)")
+            _skip(f"fixture embedded in {where}", "constant not present")
+            continue
+        if embedded != expected:
+            # The two failures look different and want different reactions: a
+            # length mismatch is usually a half-pasted literal, while equal
+            # lengths mean the builder changed under a stale constant.
+            detail = (
+                f"{len(embedded)} base64 chars embedded vs {len(expected)} built"
+                if len(embedded) != len(expected)
+                else "same length, different content -- the graph changed"
+            )
+            raise CheckFailed(
+                f"{where}'s FASHION_ONNX_BASE64 is not what build_fashion_onnx() "
+                f"produces ({detail}). Regenerate it with:\n"
+                "    python scripts/build_model.py --emit-fixture"
+            )
+        _ok(f"fixture embedded in {where}", "matches the builder")
+
+    try:
+        import numpy
+        import onnxruntime
+    except ImportError:
+        skipped.append("the fixture graph loading and running under onnxruntime")
+        _skip("fixture load", "onnxruntime/numpy not installed")
+        return skipped
+
+    session = onnxruntime.InferenceSession(fixture_bytes, providers=["CPUExecutionProvider"])
+    inputs = session.get_inputs()
+    if len(inputs) != 1 or inputs[0].name != INPUT_NAME:
+        raise CheckFailed(
+            f"the fixture declares {[i.name for i in inputs]}; the agent needs exactly "
+            f"one input named {INPUT_NAME!r} to key a bare tensor by"
+        )
+    if list(inputs[0].shape) != list(FIXTURE_INPUT_SHAPE):
+        raise CheckFailed(
+            f"the fixture reports {inputs[0].shape}, but fake.py's MLmodel signature "
+            f"claims {list(FIXTURE_INPUT_SHAPE)} -- the fixture and the descriptor "
+            "that ships with it must agree"
+        )
+
+    # Batch 3, not 1: the declared `N` is only proven dynamic by feeding
+    # something that is not 1, and the fixture's callers do not agree on a batch.
+    batch = 3
+    probe = numpy.zeros((batch, 1, 28, 28), dtype=numpy.float32)
+    (result,) = session.run(None, {INPUT_NAME: probe})
+    if tuple(result.shape) != (batch, _FIXTURE_CLASSES):
+        raise CheckFailed(
+            f"fixture output shape is {tuple(result.shape)}, expected "
+            f"{(batch, _FIXTURE_CLASSES)}"
+        )
+    _ok(
+        "fixture loads and runs",
+        f"{inputs[0].shape} -> {tuple(result.shape)} on {session.get_providers()[0]}",
+    )
+    return skipped
+
+
 def self_check(onnx_bytes: bytes, tar_bytes: bytes, model_name: str) -> list[str]:
     """Validate the artifact by calling the code that will consume it.
 
@@ -379,8 +705,8 @@ def self_check(onnx_bytes: bytes, tar_bytes: bytes, model_name: str) -> list[str
             inputs = session.get_inputs()
             if len(inputs) != 1:
                 raise CheckFailed(
-                    f"the graph declares {len(inputs)} inputs; runtime/onnx.py reads "
-                    "inputs[0] and ignores the rest (requirement 8)"
+                    f"the graph declares {len(inputs)} inputs; runtime/onnx.py can only "
+                    "key a bare tensor when there is exactly one (requirement 8)"
                 )
             if inputs[0].name != INPUT_NAME:
                 raise CheckFailed(
@@ -420,6 +746,9 @@ def self_check(onnx_bytes: bytes, tar_bytes: bytes, model_name: str) -> list[str
                 "suite's fixture no longer mirrors the real artifact layout"
             )
         _ok("fake.py mirrors this layout", f"{fake_names}")
+
+    # -- the fixture graph, and the two copies of it in the source tree -----
+    skipped.extend(check_fixture())
 
     # -- determinism -------------------------------------------------------
     #
@@ -463,6 +792,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="build in memory only; useful with --self-check",
     )
+    parser.add_argument(
+        "--emit-fixture",
+        action="store_true",
+        help="print the fixture graph as a base64 Python constant and exit "
+        "(paste into registry/fake.py and edge-agent/tests/conftest.py)",
+    )
     parser.add_argument("--quiet", action="store_true", help="only report failures")
     return parser.parse_args(argv)
 
@@ -479,6 +814,12 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.emit_fixture:
+        # Nothing else on stdout, so the output can be redirected or piped into
+        # a clipboard without a header to strip.
+        print(emit_fixture(build_fashion_onnx()), end="")
+        return 0
 
     onnx_bytes = build_minimal_onnx()
     tar_bytes = build_mlflow_tar_gz(onnx_bytes, args.model_name)

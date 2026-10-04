@@ -68,6 +68,7 @@ from lighthouse.registry.cai import (
     CAIRegistryClient,
     CdpCliTokenProvider,
     _format_and_packaging,
+    _parse_version,
     discover_domain,
 )
 
@@ -582,6 +583,100 @@ def test_the_observed_metadata_of_a_real_mlflow_version_yields_onnx():
         "the matching branch in _format_and_packaging covers this shape."
     )
     assert packaging is Packaging.MLFLOW_TAR_GZ
+
+
+# --- the real wire shape of a version, as observed on 2026-10-04 ------------
+
+# Field-for-field what a real CAI AI Registry returned for
+# `GET /api/v2/models/{id}/versions/1` -- the first version ever registered
+# against this adapter, logged by `mlflow.onnx.log_model` and promoted by
+# `cmlapi.create_registered_model`. Only the *values* that identify a tenant
+# are replaced (bucket, ids, user name); every key, every type and every
+# null is exactly as it arrived.
+#
+# Two of these types were wrong in the mocks the rest of this file uses, and
+# both would have been silent:
+#   * `version` is an int, not a string
+#   * `created_at` carries milliseconds and a `Z`, not whole seconds
+# A `created_at` this adapter cannot parse does not raise -- it makes
+# `version_uuid` collapse to the bare version number, which disables the
+# reissue-detection this file calls "the most important line". So the shape is
+# pinned here rather than left to a hand-written mock to approximate.
+_REAL_VERSION_OBJECT = {
+    "artifact_uri": (
+        "s3a://example-bucket/data/modelregistry/model-1/version-1/model.tar.gz"
+    ),
+    "created_at": "2026-10-04T00:45:28.441Z",
+    "metadata": {
+        "mlflowMetadata": {
+            "experiment_id": "exp-1",
+            "metrics": [],
+            "params": [{"key": "opset", "value": "13"}],
+            "run_id": "run-1",
+            "tags": [{"key": "lighthouse.purpose", "value": "m3-plumbing-proof"}],
+        },
+        "model_repo_type": "MLFLOW",
+        "tags": None,
+    },
+    "model_id": "model-1",
+    "model_name": "smoke-test",
+    "status": "READY",
+    "tags": None,
+    "updated_at": "2026-10-04T00:45:28.441Z",
+    "user": {"user_name": "someone"},
+    "version": 1,
+}
+
+
+def test_an_integer_version_stringifies_rather_than_leaking_its_type():
+    mv = _parse_version(_REAL_VERSION_OBJECT, model_name="smoke-test", model_id="model-1")
+    assert mv.version == "1"
+    assert isinstance(mv.version, str)
+
+
+def test_a_millisecond_timestamp_still_composes_a_lineage_key():
+    """The failure mode here is loss of drift detection, not an exception."""
+    mv = _parse_version(_REAL_VERSION_OBJECT, model_name="smoke-test", model_id="model-1")
+    assert mv.created_at is not None, (
+        "the observed `created_at` form did not parse. That is not a crash -- it "
+        "silently degrades version_uuid to a bare version number, so a deleted "
+        "and reissued version reads as unchanged and devices keep serving stale "
+        "cached bytes."
+    )
+    # Pinned as a literal, not derived from `mv.created_at`, so that a change
+    # in how the timestamp is read cannot satisfy this by moving both sides.
+    assert mv.version_uuid == "1-1791074728"
+    assert mv.version_uuid != mv.version
+
+
+def test_a_null_tags_field_becomes_an_empty_mapping():
+    """Both `tags` keys came back `null`, not absent and not `{}`."""
+    mv = _parse_version(_REAL_VERSION_OBJECT, model_name="smoke-test", model_id="model-1")
+    assert mv.tags == {}
+
+
+def test_the_real_version_object_is_deployable_end_to_end():
+    """The whole point of M3, asserted on the real shape rather than a mock."""
+    mv = _parse_version(_REAL_VERSION_OBJECT, model_name="smoke-test", model_id="model-1")
+    assert mv.status == "READY"
+    assert mv.format is ArtifactFormat.ONNX
+    assert mv.packaging is Packaging.MLFLOW_TAR_GZ
+    # Neither is on the wire at all; both are resolved from the tarball later.
+    assert mv.entrypoint is None
+    assert mv.size_bytes is None
+
+
+def test_the_artifact_uri_is_an_s3a_scheme_not_an_http_url():
+    """Worth pinning because it constrains how bytes can ever be fetched.
+
+    `artifact_uri` is an `s3a://` path into tenant object storage, so it is
+    not something the control plane can GET with its registry credential.
+    Fetching bytes has to go through the registry's own `/artifact` endpoint,
+    which is why `open_artifact` exists instead of a URI passthrough.
+    """
+    mv = _parse_version(_REAL_VERSION_OBJECT, model_name="smoke-test", model_id="model-1")
+    assert mv.artifact_uri.startswith("s3a://")
+    assert not mv.artifact_uri.startswith("http")
 
 
 # --- auth and transport failure handling --------------------------------------

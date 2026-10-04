@@ -2,6 +2,21 @@
 name = "lighthouse"
 version = "0.1.0"
 description = "Edge model governance control plane, running as a Cloudera AI Application"
+# 3.11 is load-bearing here, unlike `contracts` and `edge-agent` which really do
+# run on 3.10. Verified by running this suite under a real 3.10 interpreter
+# 2026-10-04: 3 failures, all one root cause. `datetime.fromisoformat` only
+# learned to accept a trailing "Z" in 3.11, and the registry sends exactly that
+# ("2026-10-04T00:45:28.441Z"), so on 3.10:
+#
+#   * `registry/cai.py:518` fails to parse `created_at`, which does NOT raise --
+#     it collapses `version_uuid` to the bare version number and silently
+#     disables reissue-drift detection, leaving devices on stale cached bytes;
+#   * `util.py:43` fails on stored session timestamps, so a live dashboard
+#     session reads as invalid and every request 401s.
+#
+# Do not lower this floor. If the control plane ever has to run on 3.10,
+# normalise the "Z" to "+00:00" before parsing at both sites first, and make the
+# parse failure loud rather than silent.
 requires-python = ">=3.11"
 dependencies = [
     "lighthouse-contracts",

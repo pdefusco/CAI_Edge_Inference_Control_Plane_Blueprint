@@ -4,7 +4,29 @@ Spec SS4 fixes these names. They are on the wire, so renaming one is a breaking
 protocol change -- not a refactor.
 """
 
-from enum import StrEnum
+import sys
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    # Python 3.10 fallback, and it exists for one concrete reason: the Jetson.
+    # JetPack 6 ships Python 3.10, and NVIDIA's accelerated aarch64 onnxruntime
+    # wheels are built against it, so requiring 3.11 on the device would mean
+    # either building onnxruntime from source or giving up the GPU. `keeper`
+    # imports this module, so a 3.11-only enum here would have decided that.
+    #
+    # `__str__ = str.__str__` is the whole trick and is NOT optional. Without it
+    # a plain `(str, Enum)` stringifies as "DesiredState.RUNNING" instead of
+    # "RUNNING", which would change every log line and f-string that
+    # interpolates one of these -- a wire-visible difference, since these names
+    # are on the wire (see the module docstring). With it, behaviour is
+    # identical to `enum.StrEnum`: verified 2026-10-04 on real 3.10 against real
+    # 3.11+ across str(), f-strings, format(), .value, == "x", json.dumps and
+    # "%s". `tests/test_enums_strenum_parity.py` pins that.
+    from enum import Enum
+
+    class StrEnum(str, Enum):  # noqa: D101
+        __str__ = str.__str__
 
 
 class DesiredState(StrEnum):

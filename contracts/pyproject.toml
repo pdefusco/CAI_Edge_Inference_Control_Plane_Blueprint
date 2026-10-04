@@ -2,14 +2,14 @@
 name = "lighthouse-contracts"
 version = "0.1.0"
 description = "Shared wire contracts between the Lighthouse control plane and the keeper edge agent"
-# 3.11, not 3.10: `enums.py` uses `enum.StrEnum`, which is 3.11+. This said
-# ">=3.10" until 2026-10-04, and the gap was not theoretical -- pip installed
-# cleanly on 3.10 and `import lighthouse_contracts` then raised ImportError.
-# Lowering it again means replacing all seven StrEnum classes, and `str(x)`
-# differs between `StrEnum` and `(str, Enum)`, so that is a wire-visible change
-# and not a one-line edit. See edge-agent/pyproject.toml: the Jetson is the
-# reason anyone would want 3.10 back.
-requires-python = ">=3.11"
+# 3.10 is real, not aspirational: `enums.py` falls back to a `(str, Enum)`
+# subclass with `__str__ = str.__str__` when `enum.StrEnum` is missing, and
+# `edge-agent/tests/test_enums_strenum_parity.py` asserts the two are
+# indistinguishable. Both suites are run under a real 3.10 interpreter before
+# this floor is allowed to say 3.10 -- it briefly claimed 3.10 while importing
+# `enum.StrEnum` unconditionally, which installed cleanly and then raised
+# ImportError at first import.
+requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.6",
 ]

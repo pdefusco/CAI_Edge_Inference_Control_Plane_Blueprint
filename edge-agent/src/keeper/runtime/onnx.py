@@ -10,11 +10,20 @@ with it); plain `onnxruntime` exposes only CPU. Requesting a provider that is no
 available raises, so we intersect our preference list with what the installed build
 actually reports -- otherwise the agent would fail to start on a CPU-only box for
 no good reason.
+
+`start()` runs one inference on a synthesized zero input before it reports the
+model as serving, so `RUNNING` means "the graph executed once" rather than "a
+session object was constructed" -- see its docstring for why that distinction is
+the point of the milestone and why the check lives here and not in the reconciler.
+Graphs it cannot invent an input for start anyway and say so through
+`hardware_info()["smoke_check"]`, which the fleet view reads to tell a proven
+device from an unproven one.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import platform
 from pathlib import Path
@@ -53,6 +62,73 @@ _GPU_PROVIDERS = frozenset(
     }
 )
 
+# Declared input types the smoke check will invent a zero for.
+#
+# Measured 2026-10-04 against onnxruntime 1.30.0: a nested *Python list* is
+# accepted for every element type there is, converted using the graph's own
+# declared type. So the smoke check needs no numpy -- which matters more than it
+# sounds, because it means this code path is identical on a Jetson and on a
+# laptop with no ML stack, and the tier-1 tests exercise the real thing rather
+# than a stand-in.
+#
+# Restricted to float tensors on purpose, and the restriction is about honesty
+# rather than capability. Zeros through a float graph is a safe probe. Zeros
+# through a graph whose input is an *index* -- a token id, a category, a sequence
+# length -- is not: the model may legitimately reject it, and a healthy model
+# reported FAILED is the same kind of lie as a broken one reported RUNNING, only
+# in the other direction. Those graphs get an honest "unproven" instead.
+_SMOKE_INPUT_TYPES = frozenset({"tensor(float)", "tensor(float16)", "tensor(double)"})
+
+# A ceiling on what the smoke check will allocate. A Python list of floats costs
+# ~32 bytes an element, so a 1x3x1024x1024 input would be ~100 MB of transient
+# list on an 8 GB device that is also holding CUDA -- a smoke check that OOMs the
+# agent is worse than no smoke check. Models above the cap are left unproven and
+# say so. The fixture graph is 784 elements.
+_SMOKE_MAX_ELEMENTS = 1 << 20
+
+
+def _smoke_dims(shape: Any) -> tuple[int, ...] | None:
+    """A concrete shape to allocate, or None if the graph did not declare one.
+
+    onnxruntime reports a `NodeArg.shape` mixing ints with *symbolic* dims --
+    `['N', 1, 28, 28]` for the fixture graph, and names like `unk__6` or
+    `batch_size` for models exported with dynamic axes. Symbolic dims become 1,
+    which is the whole point: a batch of one is the cheapest thing that proves
+    the graph runs.
+
+    A non-positive int is also treated as 1. Some exporters write `-1` for a
+    dynamic axis instead of a name, and `0` would allocate an empty tensor that
+    proves nothing.
+    """
+    if not shape:
+        # `None` (unknown rank) or `[]` (a rank-0 input). Neither is worth
+        # guessing at, and a rank-0 probe would raise questions about scalars
+        # that no fleet model actually asks.
+        return None
+    dims: list[int] = []
+    for dim in shape:
+        if isinstance(dim, bool):  # bool is an int subclass; never a dimension
+            return None
+        if isinstance(dim, int):
+            dims.append(dim if dim > 0 else 1)
+        elif dim is None or isinstance(dim, str):
+            dims.append(1)
+        else:
+            return None
+    return tuple(dims)
+
+
+def _zeros(dims: tuple[int, ...]) -> Any:
+    """Nested lists of 0.0 in the given shape.
+
+    Fresh lists rather than `[inner] * n`, which would alias one row across the
+    whole tensor. onnxruntime only reads the feed, so aliasing would work today
+    and become a genuinely baffling bug the first time anything wrote to it.
+    """
+    if not dims:
+        return 0.0
+    return [_zeros(dims[1:]) for _ in range(dims[0])]
+
 
 class OnnxRuntime:
     """Implements `ModelRuntime` over `onnxruntime.InferenceSession`.
@@ -70,7 +146,7 @@ class OnnxRuntime:
     in some test orders. A parameter cannot leak.
     """
 
-    def __init__(self, ort: Any = None) -> None:
+    def __init__(self, ort: Any = None, *, smoke_check: bool = True) -> None:
         if ort is None:
             try:
                 import onnxruntime  # noqa: PLC0415
@@ -85,6 +161,10 @@ class OnnxRuntime:
         self._running = False
         self._model: tuple[str, str] | None = None
         self._input_names: tuple[str, ...] = ()
+        self._smoke_check = smoke_check
+        # Reported in every heartbeat, so a device that is RUNNING-but-unproven
+        # is visible as such rather than indistinguishable from a proven one.
+        self._smoke_status = "not run"
 
     @property
     def name(self) -> str:
@@ -148,6 +228,10 @@ class OnnxRuntime:
         self._model = (name, version)
         self._input_names = tuple(arg.name for arg in session.get_inputs())
         self._running = False
+        # A new version inherits nothing from the old one's proof. Carrying a
+        # "passed" across a hot-swap would report the *previous* model's
+        # successful inference as evidence for this one.
+        self._smoke_status = "not run"
         log.info(
             "loaded %s/%s with providers %s (input=%s)",
             name,
@@ -157,10 +241,105 @@ class OnnxRuntime:
         )
 
     def start(self) -> None:
+        """Begin serving -- after proving the graph can actually execute.
+
+        Until this ran one inference, `RUNNING` meant "a session object was
+        constructed". A model can load cleanly and still be unable to execute:
+        a provider that accepts the graph and then fails on a kernel, a CUDA
+        library that resolves at load and dies at the first launch, an opset the
+        build parses but has no implementation for. All of those used to report
+        RUNNING to the dashboard, which is a governance lie in a governance tool.
+
+        This belongs here and not in the reconciler. `base.py` already documents
+        `predict` as "only used by the smoke check", `start` is already allowed
+        to raise `ModelStartError`, and `reconciler.py:157` already maps
+        `InferenceRuntimeError` to FAILED with a backoff. So RUNNING comes to
+        mean "the graph executed once" with **zero** reconciler changes and no
+        effect on `MockRuntime`. Putting it in the reconciler would have taught
+        the reconciler about tensor shapes, which is the boundary `base.py`
+        calls load-bearing.
+
+        Not every graph can be probed -- see `_smoke_plan`. A graph that cannot
+        be starts anyway and reports why, because refusing to serve a model over
+        an unsynthesizable input shape would be a worse failure than the one
+        this is guarding against.
+        """
         if self._session is None:
             raise ModelStartError("start() called before load()")
+        label = "/".join(self._model) if self._model else "model"
+
+        # The flag goes up before the probe so the probe can go through the real
+        # `predict`, feed-keying and all, rather than a private path that could
+        # drift from it. Safe because the agent is single-threaded: the reconcile
+        # loop and the heartbeat share a thread, so nothing can observe RUNNING
+        # between here and the failure branch below, which puts it back down.
         self._running = True
-        log.info("serving %s", "/".join(self._model) if self._model else "model")
+
+        if not self._smoke_check:
+            self._smoke_status = "disabled"
+            log.info("serving %s (smoke check disabled)", label)
+            return
+
+        dims, reason = self._smoke_plan()
+        if reason is not None:
+            self._smoke_status = f"skipped: {reason}"
+            log.warning("serving %s but could not prove it executes: %s", label, reason)
+            return
+
+        try:
+            outputs = self.predict(_zeros(dims))
+        except Exception as exc:
+            self._running = False
+            self._smoke_status = f"failed: {exc}"
+            raise ModelStartError(
+                f"{label} loaded but failed to execute a zero input of shape "
+                f"{list(dims)}: {exc}"
+            ) from exc
+
+        if not outputs:
+            self._running = False
+            self._smoke_status = "failed: the graph returned no outputs"
+            raise ModelStartError(
+                f"{label} executed but returned no outputs, so nothing about it "
+                "can be trusted"
+            )
+
+        self._smoke_status = "passed"
+        log.info(
+            "serving %s -- smoke inference on a zero %s input returned %d output(s)",
+            label,
+            list(dims),
+            len(outputs),
+        )
+
+    def _smoke_plan(self) -> tuple[tuple[int, ...], None] | tuple[None, str]:
+        """The shape to probe with, or why this graph cannot be probed.
+
+        Every reason here is a *skip*, never a refusal to serve, and each one is
+        reported through `hardware_info` so the fleet view can separate "proven"
+        from "unproven" instead of showing both as RUNNING.
+        """
+        if self._input_name is None:
+            return None, (
+                f"the graph declares {len(self._input_names)} inputs "
+                f"{list(self._input_names)}, and a zero input can only be matched "
+                "to a single declared one"
+            )
+        arg = self._session.get_inputs()[0]
+        declared = getattr(arg, "type", None)
+        if declared not in _SMOKE_INPUT_TYPES:
+            return None, f"no zero input can be synthesized for declared type {declared!r}"
+        shape = getattr(arg, "shape", None)
+        dims = _smoke_dims(shape)
+        if dims is None:
+            return None, f"the graph does not declare a usable input shape (got {shape!r})"
+        count = math.prod(dims)
+        if count > _SMOKE_MAX_ELEMENTS:
+            return None, (
+                f"a zero input of shape {list(dims)} would be {count} elements, "
+                f"over the {_SMOKE_MAX_ELEMENTS}-element cap this check allocates"
+            )
+        return dims, None
 
     def stop(self) -> None:
         self._running = False
@@ -170,6 +349,7 @@ class OnnxRuntime:
         self._session = None
         self._model = None
         self._input_names = ()
+        self._smoke_status = "not run"
 
     @property
     def is_running(self) -> bool:
@@ -198,6 +378,12 @@ class OnnxRuntime:
             "platform": f"{platform.system()}-{platform.machine()}",
             "runtime": self.name,
             "cpu_count": os.cpu_count(),
+            # "passed" | "not run" | "disabled" | "skipped: <why>" | "failed: <why>".
+            # A RUNNING device whose smoke check was skipped has not been proven
+            # to execute anything, and the fleet view needs to be able to say so
+            # -- otherwise "unproven" and "proven" look identical from here.
+            # `HardwareInfo` allows extra fields, so this needs no contract change.
+            "smoke_check": self._smoke_status,
         }
         try:
             providers = self._ort.get_available_providers()

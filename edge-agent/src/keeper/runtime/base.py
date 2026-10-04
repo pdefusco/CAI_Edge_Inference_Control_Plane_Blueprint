@@ -8,7 +8,15 @@ reconciliation logic leaked runtime details, M1 would prove nothing about M4.
 
 `load` and `start` are deliberately separate. Loading can fail on a corrupt or
 incompatible model -- which the agent must report as FAILED without ever claiming
-RUNNING -- while starting is the cheap flip that makes the loaded model serve.
+RUNNING -- while starting is what makes the loaded model serve.
+
+`start` is not merely a flag flip, and the separation is what buys room for that.
+`OnnxRuntime.start` runs one inference on a synthesized input before it reports
+the model as serving, because a model can load cleanly and still be unable to
+execute: a provider that accepts the graph and then has no kernel for a node, a
+CUDA library that resolves at load and dies at the first launch. `MockRuntime`
+keeps the cheap flip, and the reconciler cannot tell the two apart -- which is the
+point of this boundary.
 """
 
 from __future__ import annotations
@@ -55,7 +63,12 @@ class ModelRuntime(Protocol):
         ...
 
     def start(self) -> None:
-        """Begin serving the loaded model. Raises `ModelStartError`."""
+        """Begin serving the loaded model. Raises `ModelStartError`.
+
+        May do real work first -- `OnnxRuntime` proves the graph executes. A
+        `ModelStartError` is an `InferenceRuntimeError`, which the reconciler
+        already maps to FAILED with a backoff.
+        """
         ...
 
     def stop(self) -> None:

@@ -37,7 +37,7 @@ import pytest
 from conftest import FASHION_ONNX_BASE64, make_archive
 
 from keeper.runtime.base import InferenceRuntimeError, ModelLoadError, ModelStartError
-from keeper.runtime.onnx import _GPU_PROVIDERS, OnnxRuntime
+from keeper.runtime.onnx import _GPU_PROVIDERS, OnnxRuntime, _zeros
 
 # Module-level so a direct `pytest -m onnx` on a machine without the wheel skips
 # the file instead of erroring on the import. The marker is what keeps it out of
@@ -114,6 +114,88 @@ class TestTheFixtureIsReal:
         runtime.start()
         (logits,) = runtime.predict(image())
         assert logits.shape == (1, 10)
+
+
+class TestTheSmokeCheck:
+    """The two claims tier 1's fake asserts but cannot establish.
+
+    `test_onnx_runtime.py` pins the whole decision tree of `start()` -- which
+    graphs get probed, what tensor is synthesized, what happens on a failure --
+    against a `FakeNodeArg` whose `shape` and `type` are hard-coded to what the
+    real fixture is *believed* to report, and a `FakeSession.run` that accepts
+    anything. If either belief is wrong the fake stays green and the Jetson does
+    not. These are the tests that make the fake honest.
+    """
+
+    def test_the_real_nodearg_reports_what_the_fake_claims_it_does(self, model_path):
+        """`FakeNodeArg`'s defaults, checked against the real object.
+
+        If this fails, every tier-1 smoke-check test is asserting against a shape
+        or a type onnxruntime does not actually report -- and the most likely
+        consequence is not a red suite but a silent `skipped:` on the device,
+        because an unrecognised type is a skip by design.
+        """
+        session = ort.InferenceSession(FIXTURE, providers=["CPUExecutionProvider"])
+        (arg,) = session.get_inputs()
+        assert arg.name == "input"
+        assert arg.shape == ["N", 1, 28, 28], (
+            "a symbolic batch dim arrives as a str and the rest as ints; "
+            "tier 1's FakeNodeArg default copies this exactly"
+        )
+        assert arg.type == "tensor(float)", "and this is what _SMOKE_INPUT_TYPES gates on"
+
+    def test_a_nested_python_list_is_an_acceptable_feed(self, model_path):
+        """Why the smoke check needs no numpy, asserted rather than remembered.
+
+        Measured 2026-10-04 against onnxruntime 1.30.0: `session.run` converts a
+        nested list using the graph's own declared type. That is what lets this
+        code path be byte-identical on a Jetson and on a laptop with no ML stack,
+        and it is the one assumption in `_zeros` that only the real wheel can
+        confirm. The comparison against the numpy feed is the real assertion --
+        "it did not raise" would also pass if it quietly computed something else.
+        """
+        session = ort.InferenceSession(FIXTURE, providers=["CPUExecutionProvider"])
+        (from_list,) = session.run(None, {"input": _zeros((1, 1, 28, 28))})
+        (from_numpy,) = session.run(None, {"input": image()})
+        assert from_list.dtype == from_numpy.dtype
+        assert numpy.array_equal(from_list, from_numpy)
+
+    def test_starting_the_fixture_proves_it_executes(self, runtime, model_path):
+        """End to end on the real wheel: load, start, and the status the dashboard
+        will read. `RUNNING` now means the graph ran once."""
+        runtime.load(str(model_path), name="fashion-cnn", version="1")
+        assert runtime.hardware_info()["smoke_check"] == "not run"
+
+        runtime.start()
+        assert runtime.is_running is True
+        assert runtime.hardware_info()["smoke_check"] == "passed"
+
+    def test_the_padded_fixture_also_proves_it_executes(self, runtime, tmp_path):
+        """The 536870911 padding and the smoke check meeting each other.
+
+        The artifact fixtures the control plane serves are mostly padding, and a
+        parser that skipped the padding at *load* but choked at *execution* would
+        have been invisible before this check existed.
+        """
+        with tarfile.open(fileobj=io.BytesIO(make_archive("fashion-cnn", "1", size=65536))) as tar:
+            member = tar.extractfile("model.onnx").read()
+        path = tmp_path / "padded.onnx"
+        path.write_bytes(member)
+
+        runtime.load(str(path), name="fashion-cnn", version="1")
+        runtime.start()
+        assert runtime.hardware_info()["smoke_check"] == "passed"
+
+    def test_disabling_it_skips_the_inference_on_the_real_wheel_too(
+        self, runtime, model_path
+    ):
+        """`smoke_check=False` is what the tier-1 feed tests use, so it had better
+        mean the same thing here as it does against the fake."""
+        off = OnnxRuntime(smoke_check=False)
+        off.load(str(model_path), name="fashion-cnn", version="1")
+        off.start()
+        assert off.is_running is True
+        assert off.hardware_info()["smoke_check"] == "disabled"
 
 
 class TestLifecycle:

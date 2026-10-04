@@ -292,53 +292,56 @@ progress, so a reset connection and an empty 200 body look identical. `curl -sS
 -o /dev/null -w '%{http_code} %{size_download}\n'` plus `curl -sSi | head` is
 the whole diagnosis.
 
-**`CDSW_APP_PORT` is not advice to your app — it is what CML routes to.** It
-decides both halves: where the Application is expected to listen, and where the
-ingress sends traffic. Setting it by hand therefore moves the *route*, which is
-why no change to an entry script can recover from a bad value, and why
-`app.py`'s fallback produces a process that is healthy and unreachable at the
-same time. **Open question. Measure it; do not assume it.** The 502 above and
-the port variables below are observed; that CML derives the ingress target from
-this variable is the explanation that fits them, not something confirmed against
-CML's own behaviour. Removing the override is the test.
+**The `CDSW_*` port variables do not mirror the service port names, so do not
+reason from the mismatch.** It is tempting to: `CDSW_APP_PORT=8100` against a
+service that calls `app` 8090 looks exactly like a hand-set override, and three
+variables collapsed onto one value looks like the signature of one. Observed
+2026-10-04, it is neither. `CDSW_PUBLIC_PORT` also reads 8100 while the service
+calls `public` 8080, and **none of the three is set** in either the
+Application's environment variables or the Project's (Project Settings →
+Advanced). CAI sets all three to 8100 itself. The `SERVICE_PORT_*` names
+describe the Kubernetes service; the `CDSW_*` names describe the single port the
+engine proxies a workload through, and the two vocabularies happen to share the
+word "app".
 
-**The port variables here are overridden, and that is the whole bug.**
-Three `CDSW_*` port variables collapsed onto one value is the signature. Look in
-both places an Application inherits from — the Application's own environment
-variables and the Project's (Project Settings → Advanced) — and remove any
-`CDSW_APP_PORT`, `CDSW_PUBLIC_PORT` or `CDSW_READONLY_PORT` set by hand. CAI
-sets all three itself; overriding them aims the server at the engine's own
-ports. Note that `PORT` cannot repair this from the UI: `main.py:302` reads
-`CDSW_APP_PORT` first, so a hand-set `PORT=8090` loses to a hand-set
-`CDSW_APP_PORT=8100`. Setting `CDSW_APP_PORT=8090` directly does work, and is
-the one-variable way to test the mapping without a deploy — it moves `app.py`'s
-first candidate and CML's route together, so both ends agree.
+Still worth a look before blaming the runtime, because an override *would* break
+it the same way and is cheaper to rule out: check both of those pages and remove
+any `CDSW_APP_PORT`, `CDSW_PUBLIC_PORT` or `CDSW_READONLY_PORT` you find. Note
+that `PORT` cannot repair one from the UI — `main.py:302` reads `CDSW_APP_PORT`
+first, so a hand-set `PORT=8090` loses to a hand-set `CDSW_APP_PORT=8100`;
+setting `CDSW_APP_PORT` directly is the one-variable way to move `app.py`'s
+first candidate and CML's route together.
 
-Which two are overridden is readable from the dump. Observed 2026-10-04:
-`CDSW_APP_PORT=8100`, `CDSW_PUBLIC_PORT=8100`, `CDSW_READONLY_PORT=8100`, against
-a service that calls `app` 8090, `public` 8080 and `read_only` 8100. Only the
-read-only value is one CAI would have set on its own; the other two were put
-there by hand and both aimed at the engine. **Where they come from is worth
-checking before blaming the Application**: a project created from a tutorial
-that sets `CDSW_APP_PORT=8100` at the *project* level gives every Application in
-it the same broken route, and the Application's own settings page will look
-innocent.
+**So 8100 is the port CAI routes to, and the engine holding it is the bug.**
+That is what the 502 and the absence of any override leave: the ingress is aimed
+at the port CAI always meant, our process cannot have it, and `app.py`'s
+fallback to 8090 wins a port nothing routes to. The fix is the runtime, below —
+not the variables, and not anything an entry script can do.
 
-**The second candidate is the runtime's editor, and it is the one to try if
-removing the overrides does not fix the route.** It explains the other three
-surprises but not the 502: a port variable pointed at the wrong port would
-misroute under any editor. Every surprise in §3 — no `__file__`, a live event loop,
-the engine holding `CDSW_APP_PORT` as pid 1 with a `jupyter-wsg-launcher`
-command line — is a consequence of the script being run by a notebook kernel
-rather than as a process. A runtime whose editor is *not* kernel-backed should
-define `__file__`, start no loop, and leave `CDSW_APP_PORT` free, which would
-make all three workarounds in `app.py` inert rather than necessary. **Open
-question. Measure it; do not assume it.** The kernel behaviour is observed
-(2026-10-04, three separate failures). That a different editor avoids it is
-inference from how the failures line up, not a measurement — and it is cheap to
-test: create a second Application on a non-kernel runtime, same script, and read
-the first lines of its log. If this docstring is echoed as cell output, it is
-still a kernel.
+**Choose a runtime whose editor is not Jupyter-backed.** Every surprise in §3
+is one consequence of a single cause, and the holder's command line names it:
+`/var/lib/cdsw/deps/engine-init /var/lib/cdsw/deps/jupyter-wsg-launcher` — a
+Jupyter *websocket gateway*, which a workload only runs when its runtime executes
+code through a kernel rather than as a process. That one fact accounts for the
+missing `__file__`, the live uvloop, and a listener sitting on `CDSW_APP_PORT`
+before our script starts. A non-kernel editor should define `__file__`, start no
+loop, and leave `CDSW_APP_PORT` free, making all three workarounds in `app.py`
+inert rather than necessary.
+
+**Open question. Measure it; do not assume it.** The kernel behaviour and the
+gateway on 8100 are observed (2026-10-04, four separate failures). That a
+different editor avoids it is inference from how those line up — strong, but not
+measured, and it may not even be offered: ML Runtime catalogs have been dropping
+non-PBJ editors, so check what the Editor dropdown actually lists before
+planning around it. The test is cheap and the first lines of the log give it
+away: point a second Application at the same `app.py` on a candidate runtime,
+and if this docstring comes back echoed as cell output, it is still a kernel.
+
+If no non-kernel editor is available, the remaining options are all outside what
+an entry script can reach: ask whether CAI will route the Application to a port
+you nominate, or run the control plane as a long-running **Job** or **Session**
+rather than an Application and reach it by whatever URL that exposes. Both are
+unexplored here.
 
 `app.py` prints what all of this needs, on the failure path only: the holder's
 pid and command line, every `*PORT*` variable whose value is a bare number, and

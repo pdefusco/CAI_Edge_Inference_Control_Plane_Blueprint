@@ -25,7 +25,7 @@ AUTH    = -H "X-Lighthouse-Admin-Token: $(TOKEN)"
 JSON    = -H 'Content-Type: application/json'
 CURL    = curl -sS --fail-with-body
 
-.PHONY: help venv dev test test-fast test-plane test-agent \
+.PHONY: help venv dev test test-fast test-plane test-agent test-agent-onnx \
         deploy rollback stop revoke device events models enroll fleet clean
 
 help:
@@ -33,6 +33,7 @@ help:
 	@printf '  setup     make venv          create .venv and install all three packages editable\n'
 	@printf '  run       make dev           control plane + dashboard + simulated Jetson\n'
 	@printf '  test      make test          both suites        make test-fast  (no random order)\n'
+	@printf '            make test-agent-onnx  tier 2: the real onnxruntime wheel, opt-in\n'
 	@printf '\n  drive the loop (needs `make dev` running in another terminal)\n\n'
 	@printf '  make deploy  [VERSION=2]     PUT desired state RUNNING\n'
 	@printf '  make stop                    reversible: artifacts stay on the device\n'
@@ -68,6 +69,18 @@ test-plane:
 
 test-agent:
 	@cd edge-agent && $(PYTEST) tests -q
+
+# Tier 2: the same agent code against the real onnxruntime wheel and the real
+# fixture graph. Not part of `make test`, which must stay runnable on a laptop
+# with no ML stack -- the `onnx` marker is deselected by `addopts` in
+# edge-agent/pyproject.toml and this `-m onnx` overrides it, because pytest keeps
+# only the last `-m` on the command line.
+#
+# Needs `pip install -e 'edge-agent[onnx]'` (on a Jetson, onnxruntime comes from
+# NVIDIA's index instead). Without the wheel every test here skips rather than
+# fails, so this target is safe to run anywhere; it just proves nothing.
+test-agent-onnx:
+	@cd edge-agent && $(PYTEST) tests -q -m onnx
 
 # Deterministic order, for bisecting a failure that only appears under one seed.
 test-fast:

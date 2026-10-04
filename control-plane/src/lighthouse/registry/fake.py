@@ -110,9 +110,18 @@ _FASHION_ONNX = base64.b64decode(FASHION_ONNX_BASE64)
 #     `onnx.load`, and measured: onnx 1.23.1 parses it, `check_model(
 #     full_check=True)` accepts it, re-serializing returns the *same bytes*,
 #     and onnxruntime 1.30.0 loads and runs the result.
-#   * 536870912 raises `DecodeError`, which is the useful half of that
-#     measurement: the parser really does validate field numbers, so 536870911
-#     is a genuine boundary rather than a number that happened to work.
+#   * 536870911 is the largest field number **both** parsers accept, and they
+#     do not agree on where the limit is. Measured 2026-10-04: field 536870912
+#     raises `DecodeError` from onnx 1.23.1 (the stricter of the two, and the one
+#     `build_model.py --self-check` runs) while onnxruntime 1.30.0's C++ parser
+#     accepts it happily. So the boundary is real but belongs to onnx, not to
+#     onnxruntime -- and picking the number that clears the stricter parser is
+#     what makes this a boundary rather than a value that happened to work.
+#   * Padding that lands in a field either parser *does* read is rejected by
+#     both -- field 7 (`graph`) and field 1 (`ir_version`) both fail. That is
+#     the measurement that makes the choice of an unknown field load-bearing
+#     rather than decorative, and `test_onnx_runtime_real.py` asserts the
+#     surviving half of it against the real wheel.
 #   * `doc_string` (field 6) also worked, but did not round-trip
 #     byte-identically and leans on proto2 string fields tolerating non-UTF-8 --
 #     a bet against whatever older protobuf NVIDIA's aarch64 onnxruntime links.

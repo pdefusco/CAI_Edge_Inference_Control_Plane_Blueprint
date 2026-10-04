@@ -46,3 +46,18 @@ packages = ["src/keeper"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "onnx: needs the real onnxruntime wheel and is deselected by default (make test-agent-onnx)",
+]
+# Tier 2 is opt-in, not opportunistic. `make test` has to mean the same thing on
+# every machine, and a suite whose membership depends on what happens to be
+# pip-installed gives two developers different answers to the same command --
+# with the one that has the wheel being the only one who sees a tier-2 failure.
+# Deselecting by default also means the marker, not an `importorskip`, is what
+# keeps the wheel off the laptop dependency list.
+#
+# `make test-agent-onnx` passes its own `-m onnx`, which wins: pytest keeps only
+# the last `-m` it is given. Verified rather than assumed -- an earlier draft
+# tried `-m "onnx"` expecting the two to AND together, which selects nothing and
+# looks exactly like a suite that is passing.
+addopts = "-m 'not onnx'"

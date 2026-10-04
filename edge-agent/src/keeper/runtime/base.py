@@ -3,7 +3,7 @@
 The reconciler must not know whether inference is ONNX Runtime in-process, a
 TensorRT engine, or a mock that only pretends. That is not abstraction for its own
 sake: the entire M1 test suite runs against `MockRuntime` on a laptop, and the
-*same* reconciler code then drives `OnnxRuntimeRuntime` on the Jetson in M4. If
+*same* reconciler code then drives `OnnxRuntime` on the Jetson in M4. If
 reconciliation logic leaked runtime details, M1 would prove nothing about M4.
 
 `load` and `start` are deliberately separate. Loading can fail on a corrupt or

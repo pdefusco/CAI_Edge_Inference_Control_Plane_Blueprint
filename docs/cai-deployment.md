@@ -91,6 +91,18 @@ installed weeks ago. Observed 2026-10-04: in an interpreter with neither
 `lighthouse_contracts` and `lighthouse.main` resolve to the repo's own `src`
 trees.
 
+**An Application does not necessarily run this file the way `python app.py`
+does.** With the Workbench editor the script is handed to an IPython-style kernel
+that executes it as numbered cells, echoes the module docstring as output, and
+leaves `__file__` **undefined**. A bare `Path(__file__)` dies on
+`NameError: name '__file__' is not defined` before `run()` is reached, and the
+Application exits 1 pointing at nothing — the log looks like a config problem and
+is not. Observed 2026-10-04 in a deployed Application. `app.py` therefore locates
+the project root by checking `__file__`, then the working directory, then
+`/home/cdsw`, and *verifies* each candidate holds both `src` trees before using
+it; failing that it exits **2** with the paths it tried rather than a
+`NameError`.
+
 What the bootstrap cannot do is supply the third-party half — see
 **Dependencies** below. It is also a deliberate departure from how every other
 entry point in this repo finds the packages (`Makefile:49-53`,

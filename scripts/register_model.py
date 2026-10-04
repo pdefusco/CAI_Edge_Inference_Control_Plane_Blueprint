@@ -304,19 +304,36 @@ def discover_mechanism() -> dict:
 # --------------------------------------------------------------------------
 
 
-def lookup_experiment_id(run_id: str) -> str:
-    """Find the experiment holding `run_id`, or "" if it cannot be read.
+def lookup_experiment_id(run_id: str, experiment: str) -> str:
+    """Find the experiment id for `run_id`, or "" if it cannot be read.
 
-    Read-only, and tolerant: a failure here is not fatal on its own, because
+    Two attempts, name first. `mlflow.get_run(run_id)` on its own raises
+    `MlflowException` against CAI's bundled tracking store -- observed on a
+    real workbench -- apparently because that store will not resolve a bare
+    run id without experiment context. Looking the experiment up *by name*
+    does work, and is what Cloudera's own MLflow examples do. The name is
+    always available here because `--experiment` has a default, so this path
+    needs nothing from the operator that they do not already have.
+
+    Read-only, and tolerant: failing here is not fatal, because
     `--experiment-id` can supply the answer directly.
     """
-    try:
-        import mlflow
+    import mlflow
 
-        run = mlflow.get_run(run_id)
-        return str(run.info.experiment_id or "")
+    try:
+        exp = mlflow.get_experiment_by_name(experiment)
+        if exp is not None and exp.experiment_id:
+            return str(exp.experiment_id)
+        print(f"  no experiment named {experiment!r}")
     except Exception as exc:  # the store is remote; any of several failures
-        print(f"  could not look up the run's experiment: {type(exc).__name__}")
+        print(f"  experiment lookup by name failed: {type(exc).__name__}")
+
+    try:
+        return str(mlflow.get_run(run_id).info.experiment_id or "")
+    except Exception as exc:
+        # Exception text is withheld deliberately: it can carry the tracking
+        # URI, which is a tenant hostname.
+        print(f"  run lookup failed too: {type(exc).__name__}")
         return ""
 
 
@@ -786,7 +803,9 @@ def main(argv=None) -> int:
         # one keeps retries from littering the experiment.
         print("\n=== reusing an already-logged run ===")
         run_id, artifact_path = args.run_id, "model"
-        experiment_id = args.experiment_id or lookup_experiment_id(args.run_id)
+        experiment_id = args.experiment_id or lookup_experiment_id(
+            args.run_id, args.experiment
+        )
         print(f"  run {run_id} (experiment {experiment_id or '<unknown>'})")
         print("  nothing new was logged")
         if not experiment_id:

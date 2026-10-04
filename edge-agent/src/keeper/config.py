@@ -10,8 +10,9 @@ the recommended form: an env var is visible in `/proc/<pid>/environ` and in
 
 from __future__ import annotations
 
+import importlib.util
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +69,32 @@ class AgentSettings:
         return f"{self.control_plane_url.rstrip('/')}/{path.lstrip('/')}"
 
 
+def _runtime_is_installed(impl: str) -> bool:
+    """Whether `impl`'s dependencies are importable -- without importing them.
+
+    `find_spec` rather than a `try: import` for three reasons: importing
+    onnxruntime costs hundreds of milliseconds and loads CUDA libraries on a
+    device, doing it here would happen on every startup, and it leaves
+    `sys.modules` clean, which `test_onnx_runtime.py`'s no-leak assertion depends
+    on.
+
+    This is a *necessary* condition, not a sufficient one. A wheel built for the
+    wrong CUDA version installs fine, produces a spec, and then dies on
+    `libcublas.so` at import -- which is the realistic Jetson failure. That one is
+    caught in `main.py` around the runtime construction; both land on exit 2.
+
+    Broad except: a half-installed distribution can make the finders themselves
+    raise, and the right answer then is "no" rather than a traceback out of
+    configuration loading.
+    """
+    if impl != "onnx":
+        return True
+    try:
+        return importlib.util.find_spec("onnxruntime") is not None
+    except Exception:  # pragma: no cover - requires a corrupt installation
+        return False
+
+
 def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
     """Read one integer setting.
 
@@ -88,7 +115,19 @@ def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
 
 
-def load_settings(environ: Mapping[str, str] | None = None) -> AgentSettings:
+def load_settings(
+    environ: Mapping[str, str] | None = None,
+    *,
+    runtime_is_installed: Callable[[str], bool] = _runtime_is_installed,
+) -> AgentSettings:
+    """Build settings from an environment, refusing anything unusable.
+
+    Both parameters are injectable for the same reason: so the agent's startup
+    decisions can be tested on a laptop that has neither the environment nor the
+    wheel. `runtime_is_installed` takes the implementation name rather than being a
+    bare boolean so the signature survives a third runtime (TensorRT, spec Phase 8)
+    without changing.
+    """
     env: Mapping[str, str] = os.environ if environ is None else environ
 
     device_id = (env.get("KEEPER_DEVICE_ID") or "").strip()
@@ -126,6 +165,20 @@ def load_settings(environ: Mapping[str, str] | None = None) -> AgentSettings:
     settings.runtime_impl = (env.get("KEEPER_RUNTIME") or "mock").strip().lower()
     if settings.runtime_impl not in {"mock", "onnx"}:
         raise ConfigError(f"KEEPER_RUNTIME must be 'mock' or 'onnx', got {settings.runtime_impl!r}")
+    # A missing wheel is a misconfiguration, not a runtime fault, so it is refused
+    # here and becomes exit 2 -- which `RestartPreventExitStatus=2` in the systemd
+    # unit turns into a stopped service with a readable journal line, rather than a
+    # device that restarts every ten seconds forever. The alternative, starting up
+    # and reporting FAILED, was rejected: at this point the agent has no identity to
+    # report *with*, and `main.py:8-11`'s "a governance problem must not look like a
+    # connectivity problem" argument is about reconcile failures, not about startup.
+    if not runtime_is_installed(settings.runtime_impl):
+        raise ConfigError(
+            f"KEEPER_RUNTIME={settings.runtime_impl} but its runtime is not "
+            "importable. Install it (on a Jetson, onnxruntime comes from NVIDIA's "
+            "index rather than PyPI) or set KEEPER_RUNTIME=mock to run without "
+            "inference."
+        )
 
     # Opt-out only, and loudly: the device token travels in this request.
     verify = (env.get("KEEPER_VERIFY_TLS") or "true").strip().lower()

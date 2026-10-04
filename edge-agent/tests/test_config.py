@@ -16,10 +16,13 @@ default that quietly works differently than the operator asked for.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from keeper.config import AgentSettings, ConfigError, load_settings
+from keeper.config import AgentSettings, ConfigError, _runtime_is_installed, load_settings
+from keeper.main import run
 from keeper.runtime import MockRuntime, build_runtime
 from keeper.runtime.base import ModelLoadError
 
@@ -28,6 +31,18 @@ MINIMAL = {
     "KEEPER_CONTROL_PLANE_URL": "https://lighthouse.invalid",
     "KEEPER_TOKEN": "lhd_0123456789abcdef.secret",
 }
+
+# The two answers `runtime_is_installed` can give, injected so these tests say the
+# same thing on a laptop with no ML stack, on a dev box that happens to have
+# onnxruntime, and on the Jetson.
+#
+# `MISSING` says mock is present, which is not a convenience: the real probe cannot
+# report otherwise, because the mock runtime has no dependencies to be missing. A
+# fake that answered False for every implementation would make `load_settings`
+# refuse the default configuration -- which is how the first version of this file
+# failed, and the fake was the thing that was wrong.
+INSTALLED: Callable[[str], bool] = lambda _impl: True  # noqa: E731
+MISSING: Callable[[str], bool] = lambda impl: impl == "mock"  # noqa: E731
 
 
 def env(**overrides: str) -> dict[str, str]:
@@ -156,7 +171,8 @@ class TestRuntimeSelection:
 
     @pytest.mark.parametrize("raw", ["onnx", "ONNX", " onnx ", "Onnx\n"])
     def test_it_is_case_and_whitespace_insensitive(self, raw: str) -> None:
-        assert load_settings(env(KEEPER_RUNTIME=raw)).runtime_impl == "onnx"
+        settings = load_settings(env(KEEPER_RUNTIME=raw), runtime_is_installed=INSTALLED)
+        assert settings.runtime_impl == "onnx"
 
     def test_it_defaults_to_mock(self) -> None:
         """So the dev harness works with no configuration, and so a device that
@@ -201,6 +217,77 @@ class TestRuntimeSelection:
         `ValueError` and not `ConfigError`."""
         with pytest.raises(ValueError, match="unknown runtime"):
             build_runtime("tensorrt")
+
+
+class TestMissingWheelGate:
+    """A device told to use onnx without onnxruntime installed must refuse to
+    start, loudly, at startup -- not discover it on the first model push.
+
+    The failure mode this closes is the quiet one. Without the gate the agent comes
+    up on whatever `build_runtime` managed to construct, heartbeats happily, and
+    the operator sees a healthy device until a deployment lands and fails. The
+    device is not broken in a way anyone is looking at.
+    """
+
+    def test_a_missing_wheel_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="KEEPER_RUNTIME=onnx"):
+            load_settings(env(KEEPER_RUNTIME="onnx"), runtime_is_installed=MISSING)
+
+    def test_the_error_says_what_to_do_about_it(self) -> None:
+        """This text is the entire remedy an operator gets: one stderr line in
+        `journalctl -u keeper` after the unit refuses to start. Both ways out have
+        to be in it."""
+        with pytest.raises(ConfigError) as caught:
+            load_settings(env(KEEPER_RUNTIME="onnx"), runtime_is_installed=MISSING)
+        message = str(caught.value)
+        assert "NVIDIA" in message
+        assert "KEEPER_RUNTIME=mock" in message
+
+    def test_the_default_configuration_still_loads_on_a_bare_machine(self) -> None:
+        """The gate must not reach the mock runtime. A device with no ML stack at
+        all is the normal case for the dev harness and for a first boot."""
+        assert load_settings(env(), runtime_is_installed=MISSING).runtime_impl == "mock"
+
+    def test_an_invalid_name_is_refused_before_the_wheel_is_probed(self) -> None:
+        """Order matters for the error text. `KEEPER_RUNTIME=onnxruntime` is a
+        plausible typo, and "its runtime is not importable" would send the operator
+        hunting for a missing wheel instead of fixing the spelling."""
+        with pytest.raises(ConfigError, match="must be 'mock' or 'onnx'"):
+            load_settings(env(KEEPER_RUNTIME="onnxruntime"), runtime_is_installed=MISSING)
+
+    def test_the_real_probe_is_true_for_mock_without_importing_anything(self) -> None:
+        """`_runtime_is_installed` short-circuits on anything that is not onnx, so
+        the default `KEEPER_RUNTIME=mock` startup path does no import work at all."""
+        assert _runtime_is_installed("mock") is True
+
+    def test_the_real_probe_agrees_with_an_actual_import_attempt(self) -> None:
+        """Pins `find_spec` against the thing it is standing in for, whichever way
+        this machine is set up -- so the cheap probe cannot drift from the truth it
+        approximates. On a bare laptop both are False; in the measurement venv both
+        are True.
+
+        It does import onnxruntime when present, which is exactly what the probe
+        avoids at startup. Acceptable in a test: proving the approximation holds is
+        worth one import, and `OnnxRuntime` is only ever handed a fake elsewhere.
+        """
+        try:
+            import onnxruntime  # noqa: F401, PLC0415
+
+            really_importable = True
+        except ImportError:
+            really_importable = False
+        assert _runtime_is_installed("onnx") is really_importable
+
+    def test_the_probe_does_not_leave_onnxruntime_in_sys_modules(self) -> None:
+        """Only meaningful on a machine that has the wheel, where a probe that
+        imported would hand `test_onnx_runtime.py` a real module and quietly change
+        what those tests prove."""
+        import sys
+
+        if "onnxruntime" in sys.modules:
+            pytest.skip("something in this session already imported it legitimately")
+        _runtime_is_installed("onnx")
+        assert "onnxruntime" not in sys.modules
 
 
 class TestIntegerSettings:
@@ -252,6 +339,57 @@ class TestIntegerSettings:
         on its own, but worth a test that will notice if one is added.
         """
         assert load_settings(env(KEEPER_POLL_INTERVAL="-1")).poll_interval_seconds == -1
+
+
+class TestStartupExitCode:
+    """The wiring, not the validation: a `ConfigError` has to become exit 2.
+
+    Exit 2 is load-bearing beyond convention. The systemd unit sets
+    `RestartPreventExitStatus=2`, so this code is what stops a misconfigured device
+    from restarting every `RestartSec` forever -- filling the journal, re-probing
+    the control plane, and looking from the dashboard exactly like a device with a
+    flaky network rather than one that was configured wrong.
+
+    These are the only tests here that touch the process environment, because
+    `run()` deliberately calls `load_settings()` with no arguments: the injectable
+    mapping is for testing the *decisions*, and the entry point must read the real
+    environment or the systemd `EnvironmentFile` would do nothing.
+    """
+
+    @staticmethod
+    def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
+        for key in [k for k in os.environ if k.startswith("KEEPER_")]:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_an_unconfigured_device_exits_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear(monkeypatch)
+        assert run([]) == 2
+
+    def test_the_missing_wheel_reaches_the_same_exit_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through the real probe, which is the point -- the gate is
+        only worth anything if it is reached from `run()` rather than only from a
+        test that injects its way past it."""
+        if _runtime_is_installed("onnx"):
+            pytest.skip("this machine has onnxruntime, so the gate correctly passes")
+        self._clear(monkeypatch)
+        for key, value in MINIMAL.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("KEEPER_RUNTIME", "onnx")
+        assert run([]) == 2
+
+    def test_the_message_goes_to_stderr(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """stdout is where the log stream goes (`configure_logging` uses it), and
+        on a startup failure logging has not been configured yet. A diagnostic on
+        stdout would be mixed into whatever consumes that stream."""
+        self._clear(monkeypatch)
+        run([])
+        captured = capsys.readouterr()
+        assert "KEEPER_DEVICE_ID" in captured.err
+        assert captured.out == ""
 
 
 class TestDerivedPaths:

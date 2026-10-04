@@ -26,7 +26,7 @@ from .artifact_manager import ArtifactManager
 from .client import ControlPlaneClient
 from .config import AgentSettings, ConfigError, load_settings
 from .reconciler import Reconciler
-from .runtime import build_runtime
+from .runtime import InferenceRuntimeError, build_runtime
 from .state import StateStore
 
 log = logging.getLogger("keeper")
@@ -181,7 +181,23 @@ def run(argv: list[str] | None = None) -> int:
         return 2
 
     configure_logging(settings.log_level)
-    agent = Agent(settings)
+
+    try:
+        agent = Agent(settings)
+    except InferenceRuntimeError as exc:
+        # `load_settings` already established that the runtime's module *resolves*.
+        # This catches the case where it resolves and still cannot be imported --
+        # an onnxruntime wheel built against a CUDA the device does not have is the
+        # realistic one, and it fails on `libcublas.so` deep inside the import.
+        #
+        # Same exit code as a bad env var on purpose: from an operator's position
+        # these are the same mistake, "this device is not set up for the runtime it
+        # was told to use", and both want the service stopped rather than
+        # restarting forever. Logged as well as printed because logging is
+        # configured by now and the log line carries the timestamp.
+        log.error("runtime unavailable: %s", exc)
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
 
     if args.once:
         return agent.run_once()

@@ -4,10 +4,11 @@ Spec Phase 7. The goal is one URL that both a browser and a Jetson can reach: th
 dashboard for a human, and the three outbound device routes for the agent.
 
 Everything here is either read out of the code (with the file named, so you can
-check it) or marked as something you have to **measure**. Two things in this
-milestone could not be verified from a laptop, and they are called out as open
-questions rather than written down as facts. Do not let this file grow an
-assertion that nobody observed.
+check it) or marked as something you have to **measure**. What could not be
+verified from a laptop is called out as an open question rather than written down
+as a fact; where a real deployment has since answered one, it carries the date it
+was observed and says how far the observation actually reaches. Do not let this
+file grow an assertion that nobody observed.
 
 ---
 
@@ -101,7 +102,27 @@ is not. Observed 2026-10-04 in a deployed Application. `app.py` therefore locate
 the project root by checking `__file__`, then the working directory, then
 `/home/cdsw`, and *verifies* each candidate holds both `src` trees before using
 it; failing that it exits **2** with the paths it tried rather than a
-`NameError`.
+`NameError`. Observed 2026-10-04: in a deployed Application it resolves the root
+to `/home/cdsw` and imports `lighthouse` from `/home/cdsw/control-plane/src`.
+
+**That same kernel already has a running event loop, and uvicorn cannot start on
+it.** `run()` ends in `uvicorn.run()`, which ends in `asyncio.run()`, which
+requires that *no* loop is running in the calling thread. The kernel runs its
+cells on a live uvloop, so the stack ends
+
+```
+RuntimeError: Runner.run() cannot be called from a running event loop
+RuntimeError: Cannot run the event loop while another loop is running
+```
+
+and the Application exits 1 **after** the app was built successfully — the log
+reads as a healthy startup followed by an asyncio traceback that names nothing
+relevant. Observed 2026-10-04 in a deployed Application. `app.py` handles it by
+running `run()` in a thread of its own when, and only when, the calling thread
+already has a loop; `run()` itself is untouched, so the port, the bind address
+and the exit-2 path stay defined in one place. Observed 2026-10-04 on a laptop:
+`app.py` exec'd into a namespace with no `__file__` from inside
+`asyncio.run()` serves `/api/v1/health` and still exits 2 on a config error.
 
 What the bootstrap cannot do is supply the third-party half — see
 **Dependencies** below. It is also a deliberate departure from how every other
@@ -114,7 +135,10 @@ and that floor is load-bearing rather than aspirational: the comment above it
 records 3.10 being measured — 3 failures, one root cause, "Do not lower this
 floor." CAI runtimes ship a range of Pythons, so check the one you select *before*
 creating the Application, with `python3 -V` in a Session on that runtime. A 3.10
-runtime fails in ways that do not look like a version problem.
+runtime fails in ways that do not look like a version problem. Observed
+2026-10-04: one deployed Application ran on **3.11**, which satisfies the floor —
+that is one runtime selection, not a statement about every CAI runtime, so still
+check the one you pick.
 
 **Dependencies.** The bootstrap covers the first-party packages and nothing else.
 These still have to be present in the Application container: `fastapi`,
@@ -132,13 +156,17 @@ it is named explicitly. `cdp` also has to be on `PATH` for the default
 `registry_token_source=cli` (`registry/cai.py:190` names `pip install cdpcli`);
 that is §5's open question rather than a separate one.
 
-**Open question. Measure it; do not assume it.** Whether a `--user` install run in
-a Session reaches an *Application* container was not verified in this milestone.
-An Application gets a fresh container from the runtime image, so this turns on
-whether `--user` wrote into the project filesystem or into the image. The
-`sys.path` bootstrap removes the first-party half of that risk on purpose; it
-cannot remove the third-party half. If the Application dies on a
-`ModuleNotFoundError` for `fastapi` or `httpx`, this is why — check from inside
+**A `--user` install run in a Session does reach the Application container.**
+This was an open question in this milestone — an Application gets a fresh
+container from the runtime image, so it turned on whether `--user` wrote into the
+project filesystem or into the image. Observed 2026-10-04: an Application
+imported uvicorn from `~/.local/lib/python3.11/site-packages/`, which is where
+the Session's `--user` install put it. Note what that does *not* say: it is one
+observation on one runtime, and `~/.local` is shared across Pythons by path, so
+installing under a 3.11 Session and running the Application on a 3.10 or 3.12
+runtime would miss. The `sys.path` bootstrap removes the first-party half of this
+risk regardless; it cannot remove the third-party half. If an Application dies on
+a `ModuleNotFoundError` for `fastapi` or `httpx`, this is why — check from inside
 the Application's own environment:
 
 ```
@@ -261,10 +289,32 @@ into an Application's environment variables expires and takes the registry
 integration down with it.
 
 Startup failures here are loud by design: `main.py:278-284` builds the whole
-service graph — registry construction included, which is what resolves a domain
-and a credential — inside the `ConfigError` handler, so a missing `cai` extra, an
-unnamed domain or a rejected token exits **2** with the actionable message rather
-than a raw traceback.
+service graph — registry construction included — inside the `ConfigError`
+handler, so a missing `cai` extra or an unnamed domain exits **2** with the
+actionable message rather than a raw traceback.
+
+**A clean startup is not evidence that the credential works, and this is the
+trap.** The token is fetched *lazily*: `CliTokenProvider._fetch` runs on the
+first `token()` call, which happens only while building request headers
+(`registry/cai.py:393`), and even the `cdp`-on-`PATH` probe
+(`registry/cai.py:190`) waits until then. So an Application that reaches
+`uvicorn.run()` has proved that `httpx` is importable and that a domain was
+resolved — nothing more. Observed 2026-10-04: a deployed Application got that
+far. A missing `cdp` or an absent workload identity surfaces on the first
+registry-backed *request*, not at startup.
+
+**The cheapest way to ask is `/api/v1/health`, and it needs no credential of
+yours.** Its `registry_reachable` field is a real call —
+`CaiCatalog.ping()` (`registry/cai.py:1108`) fetches `/models` through the same
+authenticated client every other registry call uses, so a `true` there means the
+`cdp` chain worked inside the Application. Two caveats before you lean on it: the
+result is cached for 5 seconds (`registry/cai.py:82`), and `ping()` collapses
+every `RegistryError` into `false`, so it tells you *whether* and never *why*.
+When it reads `false`, §7's `/api/v1/models` is what returns the actionable
+error. And check `registry` reads `cai` in the same response: the `fake`
+registry's `ping()` just reports a fixture flag (`registry/fake.py:341-342`), so
+`registry_reachable: true` beside `registry: fake` says nothing about your
+tenant.
 
 ---
 
@@ -316,7 +366,11 @@ curl -s https://<app-url>/api/v1/health
 ```
 
 Expect JSON naming the version, the selected registry and the env — `registry`
-should read `cai`, not `fake`. Then, with the admin token:
+should read `cai`, not `fake`. Read `registry_reachable` in the same response:
+per §5 it is a real authenticated call to the registry, so `true` is your first
+evidence that the Application's `cdp` chain works. It is also the only route that
+needs no credential, which makes it the right thing to curl first. Then, with the
+admin token:
 
 ```
 curl -s https://<app-url>/api/v1/models \

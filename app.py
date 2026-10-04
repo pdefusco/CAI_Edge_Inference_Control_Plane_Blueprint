@@ -5,13 +5,21 @@ launcher in the project is easier to point an Application at than the
 `lighthouse` console script (`control-plane/pyproject.toml:52`) on `PATH`.
 
 Everything that decides whether the process is reachable -- the port, the bind
-address, the exit-2-on-ConfigError path -- is already in `main.py:268-299`. This
-file adds no behaviour and should not grow any.
+address, the exit-2-on-ConfigError path -- is already in `main.py:268-299`, and
+this file must not duplicate or second-guess any of it.
+
+What it does own is *reaching* `run()` at all, which took two measurements
+against a real Application to get right. Both are here, both are commented with
+what was observed, and neither changes what the server does once it is up:
+finding the project root without `__file__`, and starting the server when the
+caller already has a running event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 from pathlib import Path
 
 # The two packages whose `src` trees have to be importable, which is also what
@@ -84,7 +92,54 @@ for _pkg in _PACKAGES:
 
 from lighthouse.main import run
 
+
+def serve() -> None:
+    """Call `run()`, tolerating a caller that already has an event loop.
+
+    `run()` ends in `uvicorn.run()`, which ends in `asyncio.run()` and so
+    requires that *no* loop is running in the calling thread. A plain
+    interpreter satisfies that. The Workbench kernel does not -- it runs its
+    cells on a live uvloop, and the stack ends:
+
+        RuntimeError: Runner.run() cannot be called from a running event loop
+        RuntimeError: Cannot run the event loop while another loop is running
+
+    and the Application exits 1 *after* the app was successfully built, so the
+    log shows a healthy startup followed by an asyncio traceback with no
+    mention of the real cause. Observed 2026-10-04 in a deployed Application.
+
+    The fix is a thread of uvicorn's own, where `asyncio.run()` is legal again.
+    It is deliberately non-daemon and joined: the process must outlive this
+    call or CAI sees the script finish and takes the Application down with it.
+
+    `run()` is reused verbatim rather than reimplemented, so port, bind address
+    and the exit-2-on-ConfigError path stay defined in exactly one place. The
+    one thing a thread would otherwise swallow is `SystemExit` -- a config error
+    would kill the thread quietly and leave this returning 0 -- so the
+    exception is carried back out and re-raised here.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        run()  # No loop in this thread: the normal path, unchanged.
+        return
+
+    failure: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            run()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the caller
+            failure.append(exc)
+
+    thread = threading.Thread(target=_target, name="uvicorn", daemon=False)
+    thread.start()
+    thread.join()
+    if failure:
+        raise failure[0]
+
+
 # Called at module scope, not under `if __name__ == "__main__"`: CAI executes
 # this script rather than importing it, and a guard here would make an
 # Application that starts cleanly and serves nothing.
-run()
+serve()

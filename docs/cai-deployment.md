@@ -212,29 +212,55 @@ and starting the Application does not free it, and no change to `app.py` can
 take it from the engine. An Application that runs this way cannot host a server
 on the port CAI routes to.
 
-The fix is therefore at creation time, and two things are worth checking, in
-this order:
+**8100 is not the Application's port. It is the read-only port, and every
+`CDSW_*` port variable in that container pointed at it.** The container's own
+Kubernetes service-discovery variables say so outright:
 
-* **The Application's own environment variables.** In CML these two ports are
-  normally *different*, which is exactly why the sibling blueprint's
-  `--port $CDSW_READONLY_PORT` works there and is a no-op here. If either
-  variable is set by hand on the Application, remove it: the engine sets both,
-  and overriding one aims the server at the engine's own Jupyter port.
-  **Open question. Measure it; do not assume it.** What has been observed is
-  only that both read 8100 inside the container. Whether that is because they
-  were set by hand here, or because this runtime kind reports one port for both,
-  has not been read off the Application's configuration yet.
-* **The runtime and editor selected for the Application.** A
-  `jupyter-wsg-launcher` on the routed port is an editor serving JupyterLab
-  there — the same kernel-style execution that leaves `__file__` undefined and
-  keeps a live event loop, two paragraphs up. Compare the selection against an
-  Application known to serve a web app in the same workspace, and match it.
+```
+DS_RUNTIME_<id>_SERVICE_PORT_APP=8090
+DS_RUNTIME_<id>_SERVICE_PORT_READ_ONLY=8100
+DS_RUNTIME_<id>_SERVICE_PORT_PUBLIC=8080
+DS_RUNTIME_<id>_SERVICE_PORT_JUPYTER_WSG=8888
+DS_RUNTIME_<id>_SERVICE_PORT_TTY=8000
+```
 
-`app.py` prints what both checks need, on the failure path only: the holder's
-pid and command line, every `*PORT*` variable in the environment, and every port
-listening in the container with its owner. Read those before changing anything.
-Non-port `CDSW_*` variables are deliberately left out of that dump — they carry
-the workbench domain and CRNs, and this repo is public.
+while `CDSW_APP_PORT`, `CDSW_PUBLIC_PORT` **and** `CDSW_READONLY_PORT` all read
+`8100`. Observed 2026-10-04. So the engine held 8100 legitimately — that is its
+read-only view, alongside 8000 (tty) and 8888 (the Jupyter gateway), all three
+pid 1 — and **8090 was free the whole time**, named by nothing `main.py` or the
+fallback above knew to look at.
+
+`app.py` therefore has a third candidate, consulted only when neither CAI
+variable names a bindable port: any `*_SERVICE_PORT_APP` in the environment.
+Kubernetes injects those for every service in the namespace, so the one found
+may describe a sibling workload — which is sound, because the port scheme
+belongs to the CAI runtime rather than to one workload, and the bind still
+decides. When the winner comes from there, `app.py` says so on stderr, because
+this is the candidate that can be wrong in the quiet direction: a port CAI does
+not route to yields an app that looks healthy and answers nobody. **Open
+question. Measure it; do not assume it** — that 8090 is bindable has been
+observed, that the public URL *reaches* it has not. §6's probe is that check.
+
+**If the public URL does not reach it, the port variables are overridden.**
+Three `CDSW_*` port variables collapsed onto one value is the signature. Look in
+both places an Application inherits from — the Application's own environment
+variables and the Project's (Project Settings → Advanced) — and remove any
+`CDSW_APP_PORT`, `CDSW_PUBLIC_PORT` or `CDSW_READONLY_PORT` set by hand. CAI
+sets all three itself; overriding them aims the server at the engine's own
+ports. Note that `PORT` cannot repair this from the UI: `main.py:302` reads
+`CDSW_APP_PORT` first, so a hand-set `PORT=8090` loses to a hand-set
+`CDSW_APP_PORT=8100`. Setting `CDSW_APP_PORT=8090` directly does work, and is
+the one-variable way to test the mapping without a deploy.
+
+`app.py` prints what all of this needs, on the failure path only: the holder's
+pid and command line, every `*PORT*` variable whose value is a bare number, and
+every port listening in the container with its owner. Read those before changing
+anything. Two filters on that dump are deliberate and should stay: non-port
+`CDSW_*` is excluded because it carries the workbench domain and CRNs, and
+non-numeric values are excluded because service discovery sets
+`<SERVICE>_PORT=tcp://172.x.y.z:8100` and `..._TCP_ADDR=172.x.y.z` for every
+service in the namespace — a name filter alone prints the cluster's internal
+addressing into a log someone pastes into an issue. This repo is public.
 
 **Set neither port variable yourself**, and leave `LIGHTHOUSE_HOST` unset too:
 `main.py:298` already binds `0.0.0.0` whenever the env is not `local`, which a

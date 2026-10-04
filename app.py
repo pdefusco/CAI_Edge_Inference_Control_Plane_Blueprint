@@ -177,15 +177,24 @@ def _port_report(*, proc: Path = Path("/proc")) -> list[str]:
 
     Printed alongside the bind failure because the two causes §3 distinguishes
     are told apart by exactly this: which ports CAI *named*, and whether any of
-    them is free. Only variables whose name contains `PORT` are shown -- the
-    rest of `CDSW_*` carries the workbench domain and CRNs, which identify a
-    tenant and have no business in a log someone will paste into an issue
-    (`[[lighthouse-repo-is-public]]`).
+    them is free.
+
+    Shown only if the name contains `PORT` *and* the value is a bare number.
+    Both halves are load-bearing. The name filter keeps out the workbench domain
+    and CRNs, which identify a tenant. The numeric filter was added after the
+    first real dump leaked private IPs: Kubernetes service discovery sets
+    `<SERVICE>_PORT=tcp://172.x.y.z:8100` and `..._PORT_8100_TCP_ADDR=172.x.y.z`
+    for every service in the namespace, so a name filter alone prints the
+    cluster's internal addressing into a log someone pastes into an issue. A
+    port number is the whole point here and carries no tenant identity.
+    Observed 2026-10-04 (`[[lighthouse-repo-is-public]]`).
     """
     lines: list[str] = []
     try:
         offered = sorted(
-            (name, value) for name, value in os.environ.items() if "PORT" in name
+            (name, value)
+            for name, value in os.environ.items()
+            if "PORT" in name and value.isdigit()
         )
         if offered:
             lines.append(
@@ -201,6 +210,34 @@ def _port_report(*, proc: Path = Path("/proc")) -> list[str]:
     except Exception:  # noqa: BLE001 -- a diagnostic must not mask the error
         return lines
     return lines
+
+
+def _app_service_ports() -> list[tuple[str, str]]:
+    """Ports that Kubernetes service discovery calls an **app** service port.
+
+    The repair for a `CDSW_APP_PORT` that does not name the Application's port.
+    Observed 2026-10-04 in a deployed Application: all three of `CDSW_APP_PORT`,
+    `CDSW_PUBLIC_PORT` and `CDSW_READONLY_PORT` read **8100**, which the same
+    environment identifies as the *read-only* port --
+
+        DS_RUNTIME_<id>_SERVICE_PORT_APP=8090
+        DS_RUNTIME_<id>_SERVICE_PORT_READ_ONLY=8100
+
+    -- so every variable `main.py` and the fallback above know about pointed at
+    the port the engine serves JupyterLab on, and 8090 sat free and unexamined.
+
+    Kubernetes injects these for every service in the namespace, so the value
+    found may belong to a *sibling* workload rather than this one. That is
+    sound: the port scheme is a property of the CAI runtime, not of one
+    workload. It is still only a candidate -- the bind decides, and the caller
+    says loudly when the winner came from here, because a port CAI does not
+    route to produces an app that looks healthy and answers nobody.
+    """
+    found: dict[int, str] = {}
+    for name, value in sorted(os.environ.items()):
+        if name.endswith("_SERVICE_PORT_APP") and value.isdigit():
+            found.setdefault(int(value), name)
+    return [(name, str(port)) for port, name in sorted(found.items())]
 
 
 def _pick_port() -> None:
@@ -222,9 +259,16 @@ def _pick_port() -> None:
     (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`), which serves a
     FastAPI app from a CAI Application by binding `$CDSW_READONLY_PORT`. It
     cannot help when the two variables name the *same* port, which is what was
-    observed here -- both were 8100. The probe stays anyway: it is still the
-    only thing that tells the two runtime kinds apart, and it costs one bind.
-    See `docs/cai-deployment.md` §3 for what to change instead.
+    observed here -- both 8100, and 8100 is the read-only port. `0.0.0.0` is
+    kept for the probe even though that blueprint binds loopback: on Linux a
+    loopback bind fails `EADDRINUSE` against a wildcard holder just the same, so
+    it would not rescue a taken port, and only `0.0.0.0` is reachable from a
+    proxy in another container.
+
+    So there is a third candidate, `_app_service_ports()`, which reads the port
+    Kubernetes service discovery *calls* the app port. It is last because it can
+    name a sibling workload's service, and the two CAI variables are right
+    whenever they are right. See `docs/cai-deployment.md` §3.
 
     Hardcoding the read-only port would just move the breakage: both variables
     are set either way, so a plain-process Application would then bind a port
@@ -246,12 +290,18 @@ def _pick_port() -> None:
     if os.environ.get("PORT"):
         return  # Explicitly asked for; not ours to second-guess.
 
+    candidates: list[tuple[str, str]] = [
+        (name, os.environ[name])
+        for name in ("CDSW_APP_PORT", "CDSW_READONLY_PORT")
+        if os.environ.get(name)
+    ]
+    # Last, and only as a repair: see `_app_service_ports`.
+    discovered = {name for name, _ in _app_service_ports()}
+    candidates += _app_service_ports()
+
     tried: list[str] = []
     failed_ports: list[int] = []
-    for name in ("CDSW_APP_PORT", "CDSW_READONLY_PORT"):
-        raw = os.environ.get(name)
-        if not raw:
-            continue
+    for name, raw in candidates:
         try:
             port = int(raw)
         except ValueError:
@@ -270,6 +320,17 @@ def _pick_port() -> None:
         if tried:
             print(
                 f"{name}={port} is free; not using " + ", ".join(tried),
+                file=sys.stderr,
+            )
+        if name in discovered:
+            # Worth a line of its own: this is the candidate that can be wrong
+            # in the quiet direction. If the app starts and `probe_app.py` still
+            # cannot reach it, this is the first thing to suspect.
+            print(
+                f"serving on {port}, taken from {name} because no CDSW_* port"
+                " variable named a port that could be bound. If the public URL"
+                " does not reach this, the Application's port variables are"
+                " overridden -- see `docs/cai-deployment.md` §3.",
                 file=sys.stderr,
             )
         # Handed over as `PORT` with `CDSW_APP_PORT` cleared, which is how

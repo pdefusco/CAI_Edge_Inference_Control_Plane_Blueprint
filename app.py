@@ -278,6 +278,30 @@ def _port_report(*, proc: Path = Path("/proc")) -> list[str]:
     return lines
 
 
+def _bind_error(port: int, host: str) -> str | None:
+    """`None` if uvicorn could bind `host:port`, else the errno's text.
+
+    `SO_REUSEADDR` matches what uvicorn sets, so this probe succeeds exactly
+    when uvicorn's own bind would.
+
+    The caller's wildcard-then-loopback fallback is only meaningful under Linux
+    semantics, where a wildcard bind collides with a holder of any specific
+    address on that port and vice versa. **BSD differs**: on macOS, with
+    `SO_REUSEADDR`, a wildcard bind coexists with a specific-address holder, so
+    this probe answers a materially different question there. That is harmless
+    -- the Application is Linux and a laptop sets none of these variables -- but
+    it does mean the fallback cannot be verified against real sockets on a Mac.
+    Observed 2026-10-04 while testing exactly that.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError as exc:
+            return exc.strerror or str(exc)
+    return None
+
+
 def _app_service_ports() -> list[tuple[str, str]]:
     """Ports that Kubernetes service discovery calls an **app** service port.
 
@@ -329,24 +353,38 @@ def _pick_port() -> None:
     `_port_holder` named the holder as **pid 1**, the engine's own
     `jupyter-wsg-launcher`.
 
-    The fallback to `CDSW_READONLY_PORT` comes from a sibling blueprint
-    (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`), which serves a
-    FastAPI app from a CAI Application by binding `$CDSW_READONLY_PORT` and
-    works on this same runtime -- which means that there, the two variables hold
-    *different* values. Here they have collapsed onto one, both 8100, and the
-    fallback has nowhere to go. Why they collapsed is the open question
-    (`docs/cai-deployment.md` §3); setting `CDSW_READONLY_PORT` by hand to the
-    sibling's value reproduces its working configuration and is the cheap test.
-    `0.0.0.0` is kept for the probe even though that blueprint binds loopback:
-    on Linux a loopback bind fails `EADDRINUSE` against a wildcard holder just
-    the same, so it would not rescue a taken port, and only `0.0.0.0` is
-    reachable from a proxy in another container.
+    **Each port is tried on `0.0.0.0` and then on `127.0.0.1`, and the port
+    matters more than the address.** This is the correction to an earlier
+    version of this file, which probed only the wildcard and so reported
+    `CDSW_APP_PORT` "taken" without testing the address that was free. On Linux
+    a wildcard bind collides with a holder of *any* specific address on that
+    port, so `0.0.0.0:8100` failing is consistent with the holder sitting on one
+    specific address and `127.0.0.1:8100` being bindable. The earlier version
+    also claimed only `0.0.0.0` is reachable "from a proxy in another
+    container", which is wrong: a sibling blueprint
+    (`CAI_Agentic_NBA_Observability_Blueprint`, `deploy/cai/start.py`) sets
+    `BIND_HOST=127.0.0.1` on `CDSW_APP_PORT` and is reachable in production.
+    CAI proxies an Application from *inside its own pod*, which is exactly what
+    `CDSW_APP_PORT` meaning "the port the engine proxies a workload through"
+    implies. So winning the routed port on loopback beats winning an unrouted
+    port on the wildcard, and that is the order here.
+
+    The fallback to `CDSW_READONLY_PORT` comes from that same blueprint, which
+    offers it as a selectable alternative (`CAI_SELLER_PORT_VARIABLE`) for when
+    `CDSW_APP_PORT` is occupied. Observed 2026-10-04: here both variables read
+    8100, so the fallback had nowhere to go until `CDSW_READONLY_PORT` was set
+    by hand -- and the 8090 it then bound is still not the routed port.
 
     So there is a third candidate, `_app_service_ports()`, which reads the port
     Kubernetes service discovery *calls* the app port. It is last and it is not
     a repair -- measured, its 8090 is bindable and routes to nobody. It exists
     to turn a crash into a live process that can be probed. See
     `docs/cai-deployment.md` §3.
+
+    The winner is exported as `LIGHTHOUSE_HOST` as well as `PORT`, because a
+    loopback win is only correct if `main.py:303` actually binds there; its
+    default for a non-local env is `0.0.0.0`, which would re-raise the very
+    `EADDRINUSE` this probe just avoided.
 
     Hardcoding any one of these just moves the breakage, because "it bound" and
     "it is reachable" are different facts and only the first is testable from
@@ -378,6 +416,11 @@ def _pick_port() -> None:
     discovered = {name for name, _ in _app_service_ports()}
     candidates += _app_service_ports()
 
+    # An explicit `LIGHTHOUSE_HOST` is honoured the way `PORT` is: probe only
+    # what the caller asked for rather than silently binding somewhere else.
+    chosen_host = os.environ.get("LIGHTHOUSE_HOST")
+    hosts = (chosen_host,) if chosen_host else ("0.0.0.0", "127.0.0.1")
+
     tried: list[str] = []
     failed_ports: list[int] = []
     for name, raw in candidates:
@@ -386,38 +429,54 @@ def _pick_port() -> None:
         except ValueError:
             tried.append(f"{name}={raw!r} (not a number)")
             continue
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            # The same option uvicorn sets, so this probe succeeds exactly when
-            # uvicorn's own bind would.
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                probe.bind(("0.0.0.0", port))
-            except OSError as exc:
-                tried.append(f"{name}={port} ({exc.strerror})")
-                failed_ports.append(port)
-                continue
+        for host in hosts:
+            error = _bind_error(port, host)
+            if error is None:
+                break
+            tried.append(f"{name}={port} on {host} ({error})")
+            failed_ports.append(port)
+        else:
+            continue  # Every address refused this port; try the next candidate.
+
         if tried:
             print(
-                f"{name}={port} is free; not using " + ", ".join(tried),
+                f"{name}={port} is free on {host}; not using "
+                + ", ".join(tried),
                 file=sys.stderr,
             )
-        if name in discovered:
-            # The candidate that can be wrong in the quiet direction, so it
-            # gets the full dump rather than one line. Observed 2026-10-04: this
-            # path produced a process that served happily on 8090 while the
-            # public URL returned a 502 from the ingress, and the dump was
-            # unavailable precisely because nothing had *failed*. Whether the
-            # engine's hold on the routed port is on `0.0.0.0` or only on
-            # loopback decides whether that port is winnable at all, and that is
-            # in this table.
+        # Anything but the routed port on the wildcard address is a compromise,
+        # and the two compromises fail in opposite directions, so each says which
+        # one it made and both get the full table. Observed 2026-10-04: a
+        # fallback served happily on 8090 while the public URL returned a 502
+        # from the ingress, and the table was unavailable precisely because
+        # nothing had *failed*.
+        if name in discovered or name != "CDSW_APP_PORT":
             print(
                 "\n".join(
                     [
-                        f"serving on {port}, taken from {name} because no CDSW_*"
-                        " port variable named a port that could be bound. CAI"
-                        " does not route the Application's URL here, so expect"
-                        " a 502 from the ingress until the routed port is"
-                        " winnable -- see `docs/cai-deployment.md` §3.",
+                        f"serving on {port}, taken from {name} because"
+                        " CDSW_APP_PORT could not be bound on any address. CAI"
+                        " routes the Application's URL to CDSW_APP_PORT, not"
+                        " here, so expect a 502 from the ingress -- see"
+                        " `docs/cai-deployment.md` §3.",
+                        *_port_report(),
+                    ]
+                ),
+                file=sys.stderr,
+            )
+        elif host != "0.0.0.0":
+            # The good outcome, and still worth a line: it means the holder of
+            # this port bound a *specific* address, so we took the routed port
+            # on a different one. Reachable only because CAI proxies an
+            # Application from inside its own pod -- which is how the sibling
+            # blueprint has always worked.
+            print(
+                "\n".join(
+                    [
+                        f"serving on {port} ({name}) bound to {host} rather than"
+                        " 0.0.0.0, which is already taken. This is the routed"
+                        " port, so the URL should work; the table below says who"
+                        " holds the wildcard.",
                         *_port_report(),
                     ]
                 ),
@@ -428,6 +487,7 @@ def _pick_port() -> None:
         # hand (`env -u CDSW_APP_PORT PORT=8900`). `main.py` stays generic and
         # keeps deciding the port in one place.
         os.environ["PORT"] = str(port)
+        os.environ["LIGHTHOUSE_HOST"] = host
         os.environ.pop("CDSW_APP_PORT", None)
         return
 
@@ -444,8 +504,10 @@ def _pick_port() -> None:
             "  If the holder is an earlier instance of this app, stop the"
             " Application fully and start it again rather than restarting it."
             " If it is the engine -- pid 1, or a command line naming"
-            " `engine-init`, `jupyter` or `workbench` -- then no change to this"
-            " script can win that port, and the fix is at creation time."
+            " `engine-init`, `jupyter` or `workbench` -- then read the address"
+            " column above: every port was refused on both 0.0.0.0 and"
+            " 127.0.0.1, so a holder shown on 0.0.0.0 cannot be worked around"
+            " from here and the fix is at creation time (the runtime's editor)."
             " See `docs/cai-deployment.md` §3."
         )
         print("\n".join(lines), file=sys.stderr)

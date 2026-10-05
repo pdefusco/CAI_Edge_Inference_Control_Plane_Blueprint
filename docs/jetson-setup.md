@@ -27,7 +27,7 @@ The acceptance criterion is therefore behavioural, not a version match:
 
 | | why, and where it is settled |
 |---|---|
-| A control-plane URL a bearer-token client can reach | `scripts/probe_app.py`, run off-VPN. `docs/cai-deployment.md` §6 has the outcome table; the row you are in decides what goes in `KEEPER_CONTROL_PLANE_URL` |
+| A control-plane URL a bearer-token client can reach | **Measured 2026-10-05: row 1.** `scripts/probe_app.py` off VPN reported `REACHABLE, and bearer auth is intact` against a deployed Application, so `KEEPER_CONTROL_PLANE_URL` is the app URL. `docs/cai-deployment.md` §6 has the outcome table and what the other rows would have cost — re-run the probe for your own deployment rather than inheriting this |
 | A model `READY` and `deployable: true` | `scripts/probe_registry.py`. Nothing on the device can fix a model that is not deployable |
 | A `device_id` you have chosen | it must match what you enrol in §4; a mismatch is a 403 on every poll, which on the dashboard is indistinguishable from a device that never came online |
 | This checkout, on the device | `scripts/install_keeper.sh` installs from it |

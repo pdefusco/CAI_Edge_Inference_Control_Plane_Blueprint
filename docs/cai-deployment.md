@@ -683,11 +683,42 @@ as the device answer. What it newly settles, none of which the health curl could
   post-fix code and the disclosure described later in this section is closed in
   the deployment, not only in the repo.
 
-Still owed, and neither is a formality: **the off-VPN run**, which is the only
-one that speaks for a Jetson on a home network, and whether
-**`X-Lighthouse-Admin-Token`** — a *custom* header, the one CML's ingress might
-plausibly drop where it forwards `Authorization` — survives. The second needs
-`--admin-token-env`, which the run above did not pass.
+**Measured 2026-10-05, off VPN, and this is the run that decides: row 1.** The
+same probe from the same laptop with the tunnel down returned byte-identical
+results — `REACHABLE, and bearer auth is intact`, every device route answering
+with our own 401 envelope, the no-header control still saying `device token
+required` where an invalid token says `invalid device token`. **A Jetson on an
+ordinary home network can reach this control plane and authenticate with a
+bearer token.** That was the open risk the whole device half of the project was
+contingent on, and it is retired. `KEEPER_CONTROL_PLANE_URL` is the app URL.
+
+Identical in and out of the tunnel is itself worth noting: the ingress treats
+the two vantage points the same, so there is no split-horizon arrangement where
+a device would see something the laptop did not.
+
+**Both operator transports survive the ingress, which closes the question at
+`api/auth.py:22-27`.** The off-VPN run passed `--admin-token-env`, and both
+`X-Lighthouse-Admin-Token` and `Authorization: Bearer` came back **401 with
+`invalid operator credential`** — not 200, because the token presented did not
+match the Application's, but that is the wrong field to read. `api/auth.py`
+raises `operator credential required` only when nothing was presented, and
+`invalid operator credential` only when it had a value to compare. The second
+message therefore proves the header *arrived*. A stripped header is the first
+message. Both transports produced the second, so CML's ingress forwards the
+custom header as well as the standard one.
+
+That answer does not retire the three-credential design — a 401 here still had
+to be distinguished from a drop, which is exactly what took a message
+comparison to see. But it does mean the bearer fallback is redundancy rather
+than the only working path.
+
+Read that distinction carefully, because the script used to get it wrong: it
+judged these two lines on `status == 200` alone, printed `did NOT work` for both,
+and advised checking the token — right conclusion, wrong reasoning, and it
+discarded evidence it already had in hand. `probe_app.py` now reports
+`FORWARDED (arrived; token refused)` and says why. If you see that, the fix is
+the token value, not the ingress: compare what you passed against the
+Application's `LIGHTHOUSE_ADMIN_TOKEN`.
 
 **Row 2 is where an authentication-enabled Application lands, and you do not
 need the VPN off to see it.** Observed 2026-10-04, curling
@@ -724,12 +755,13 @@ because it is evidence about the platform and not about this deployment:
 
 What it does *not* establish: that a bearer token survives the ingress to reach
 our own auth layer, which is row 1 and a different question — that Application
-was not this one and did not use `Authorization: Bearer` against
-`api/auth.py`. So still run `probe_app.py` twice. The value of the finding is
-that it tells you which way to set the toggle **before** you measure, rather than
-discovering it afterwards: create this Application with authentication
-**disabled**, and §3's "write down which way you set that toggle" then has a
-deliberate answer rather than a default.
+was not this one and did not use `Authorization: Bearer` against `api/auth.py`.
+**That gap is now closed directly, by the off-VPN probe above, against this
+deployment.** This finding is kept because it was what justified setting the
+toggle before there was anything to measure, and because it is the reason the
+order of operations above is the right one: create the Application with
+authentication **disabled**, so §3's "write down which way you set that toggle"
+has a deliberate answer rather than a default.
 
 **What disabling the toggle costs, and what was done about it.** Everything the
 app serves without a credential of its own is then served to the public

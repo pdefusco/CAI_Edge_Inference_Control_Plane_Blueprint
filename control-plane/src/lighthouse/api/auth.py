@@ -20,11 +20,22 @@ token reaching another device's resource is 403. Collapsing them would hide a
 misconfigured fleet (two devices sharing a token) inside generic auth noise.
 
 **The admin credential is accepted in three places on purpose.** Whether CML's
-ingress forwards custom request headers to a CAI Application is unverified, so
+ingress forwards custom request headers to a CAI Application was unverified, so
 relying solely on `X-Lighthouse-Admin-Token` would risk an admin surface that
 cannot be reached at all once deployed. `Authorization: Bearer lha_…` is the
 fallback, and the cookie is what the dashboard uses so the token never sits in
 `localStorage` or a URL.
+
+Measured 2026-10-05 against a deployed Application, off VPN: **both header
+transports arrive.** `scripts/probe_app.py --admin-token-env …` presented the
+same credential each way and both were answered `invalid operator credential`
+rather than `operator credential required` — and the difference between those
+two strings below is the whole measurement, since the former is only reachable
+once `presented` is truthy. So the custom header is not stripped, and the
+bearer form is redundancy rather than the only working path. Both are kept:
+the cost is a few lines, and the alternative is rediscovering this on an
+ingress that behaves differently. Do not collapse the two messages into one --
+`docs/cai-deployment.md` §6 records what reading them apart bought.
 
 **The cookie is not the admin token.** It holds a session secret with its own
 expiry, revocable on logout, verified against `SessionStore` rather than against

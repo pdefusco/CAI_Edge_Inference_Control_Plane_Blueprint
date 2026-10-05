@@ -28,6 +28,16 @@ unverified" -- by sending an operator credential both ways, in the custom
 reporting which survived. That is why the admin surface accepts three
 credentials; this says whether it needed to.
 
+Survival is read from the *message*, not the status code. A 401 happens both
+when the ingress strips the header and when the header arrives carrying the
+wrong token, and those need opposite fixes -- no token will solve the first, and
+no ingress change will solve the second. `api/auth.py` answers "operator
+credential required" only when nothing was presented and "invalid operator
+credential" only when it had something to compare, so the two are separable from
+outside. An earlier version of this script judged these on `status == 200` alone
+and printed "did NOT work" for both cases, which reads as an ingress failure
+when a mistyped token is far likelier.
+
 Usage, from wherever you want to measure *from* (that choice is the experiment):
 
     python scripts/probe_app.py --url https://<app>.<domain>
@@ -402,6 +412,51 @@ def _ours(step: dict | None) -> bool:
     return bool(step) and str(step.get("source", "")).startswith("lighthouse")
 
 
+# What `require_operator` says, and what each answer proves about the ingress.
+# These strings are the measurement: `api/auth.py` raises "operator credential
+# required" only when `presented` is falsy, and "invalid operator credential"
+# only when it had something to compare. So the second one means the header
+# *arrived* -- a 401 is not evidence of a stripped header, and treating it as
+# one is how "did NOT work" gets read as "the ingress dropped it".
+_ARRIVED_BUT_REFUSED = "invalid operator credential"
+_NEVER_ARRIVED = "operator credential required"
+
+_TRANSPORT_LABEL = {
+    "accepted": "FORWARDED and accepted",
+    "forwarded": "FORWARDED (arrived; token refused)",
+    "stripped": "NOT FORWARDED (never reached the app)",
+    "unconfigured": "unknown -- the app has no admin token configured",
+    "unknown": "unclear; read the body above",
+}
+
+
+def _transport(step: dict) -> str:
+    """Whether an operator credential reached `api/auth.py`, from the outside.
+
+    Status alone cannot tell you: a 401 is returned both when the header was
+    stripped in transit and when it arrived carrying the wrong value, and those
+    call for opposite fixes -- one is an ingress problem that no token can
+    solve, the other is a typo. The message separates them, which is the same
+    trick the device verdict above turns on and the reason `api/auth.py` keeps
+    the two phrasings distinct.
+    """
+    if step.get("error") or not _ours(step):
+        return "unknown"
+    status = step.get("status", 0)
+    if status == 200:
+        return "accepted"
+    if status == 503:
+        # "operator authentication is not configured" -- the app refused before
+        # looking at the credential, so this says nothing about transport.
+        return "unconfigured"
+    message = str((step.get("parsed") or {}).get("message", ""))
+    if message == _ARRIVED_BUT_REFUSED:
+        return "forwarded"
+    if message == _NEVER_ARRIVED:
+        return "stripped"
+    return "unknown"
+
+
 def verdict(
     health: dict,
     device: dict[str, dict],
@@ -466,20 +521,36 @@ def verdict(
         say("the browser surface only. Operators sign in through it; the device")
         say("is unaffected. This is the one SSO arrangement Phase 7 survives.")
     if operator:
-        custom_ok = operator["custom_header"].get("status") == 200
-        bearer_ok = operator["bearer"].get("status") == 200
+        custom = _transport(operator["custom_header"])
+        bearer = _transport(operator["bearer"])
         say("")
         say("operator credential transport (api/auth.py:21-27):")
-        say(f"  X-Lighthouse-Admin-Token  -> {'FORWARDED' if custom_ok else 'did NOT work'}")
-        say(f"  Authorization: Bearer     -> {'FORWARDED' if bearer_ok else 'did NOT work'}")
-        if not custom_ok and bearer_ok:
-            say("  The custom header is stripped. The bearer fallback is why the")
-            say("  admin surface is reachable at all -- keep all three forms.")
-        elif custom_ok and not bearer_ok:
-            say("  The bearer form failed while the custom header worked. Note it;")
-            say("  the dashboard's cookie exchange depends on neither.")
-        elif not custom_ok and not bearer_ok:
-            say("  Neither worked. Check the token itself before blaming ingress.")
+        say(f"  X-Lighthouse-Admin-Token  -> {_TRANSPORT_LABEL[custom]}")
+        say(f"  Authorization: Bearer     -> {_TRANSPORT_LABEL[bearer]}")
+        arrived = {"accepted", "forwarded"}
+        if custom in arrived and bearer in arrived:
+            say("  Both transports reach api/auth.py. The ingress forwards the")
+            say("  custom header as well as the standard one, which is the")
+            say("  question api/auth.py:22-27 was left open on -- answered.")
+        elif bearer in arrived and custom not in arrived:
+            say("  The custom header does not arrive. The bearer fallback is why")
+            say("  the admin surface is reachable at all -- keep all three forms.")
+        elif custom in arrived and bearer not in arrived:
+            say("  The bearer form does not arrive while the custom header does.")
+            say("  Note it; the dashboard's cookie exchange depends on neither.")
+        if "forwarded" in (custom, bearer) and "accepted" not in (custom, bearer):
+            say("")
+            say("  Note the credential ARRIVED and was refused on its merits:")
+            say("  'invalid operator credential' is what api/auth.py answers when")
+            say("  it has a credential to judge, and 'operator credential")
+            say("  required' is what it answers when the header never came. So")
+            say("  this is the token value, not the ingress -- compare what you")
+            say("  passed against the Application's LIGHTHOUSE_ADMIN_TOKEN.")
+        if "unconfigured" in (custom, bearer):
+            say("")
+            say("  The app answered 503: it has NO admin token configured, so its")
+            say("  whole operator surface is closed. Under LIGHTHOUSE_ENV=cai that")
+            say("  should be fatal at startup -- check the Application's env.")
     return 0
 
 

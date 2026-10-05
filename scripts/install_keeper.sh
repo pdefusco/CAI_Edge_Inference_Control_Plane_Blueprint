@@ -41,8 +41,14 @@ device_id="${1:-$(hostname -s 2>/dev/null || hostname)}"
 
 (($(id -u) == 0)) || die "run this with sudo -- it creates a system user and writes to /etc"
 command -v systemctl >/dev/null 2>&1 || die "no systemctl; this installer is systemd-only"
-[[ -f "$REPO_ROOT/edge-agent/pyproject.toml" ]] ||
-  die "run this from a checkout: $REPO_ROOT/edge-agent/pyproject.toml is missing"
+# Both, because the agent is not installable without the contracts package next
+# to it and the pip failure for a missing `contracts/` names only
+# `lighthouse-contracts`, which reads like a broken dependency rather than an
+# incomplete checkout.
+for pkg in contracts edge-agent; do
+  [[ -f "$REPO_ROOT/$pkg/pyproject.toml" ]] ||
+    die "run this from a checkout: $REPO_ROOT/$pkg/pyproject.toml is missing"
+done
 
 # The agent targets python >= 3.10 and uses `X | None` annotations at runtime in
 # dataclasses, so an older interpreter fails at import rather than at type-check
@@ -102,6 +108,15 @@ fi
 # whatever NVIDIA put in the system site-packages -- see above. The agent checks
 # for an importable onnxruntime at startup and says what to do when there is none.
 "$VENV/bin/pip" install --quiet --upgrade pip
+# `contracts` first, and by path, because `lighthouse-contracts` is NOT on PyPI.
+# edge-agent/pyproject.toml depends on it by name, so installing edge-agent alone
+# sends pip to an index and fails with "No matching distribution found for
+# lighthouse-contracts". Every other install path in this repo passes both
+# packages for this reason -- Makefile:52, scripts/_common.sh:43,
+# docs/cai-deployment.md §3 -- and this one did not, which went unnoticed because
+# a laptop always has them installed editable already. The first real device
+# found it in the first thirty seconds.
+"$VENV/bin/pip" install --quiet --upgrade "$REPO_ROOT/contracts"
 "$VENV/bin/pip" install --quiet --upgrade "$REPO_ROOT/edge-agent"
 say "keeper    $("$VENV/bin/keeper" --help >/dev/null 2>&1 && echo installed || echo 'installed but not runnable')"
 

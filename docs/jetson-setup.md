@@ -5,14 +5,19 @@ unit and the installer are `deploy/keeper.service` and
 `scripts/install_keeper.sh`, and every landmine in them is commented in place
 rather than repeated here.
 
-**This document asserts no version facts.** Not the JetPack release, not the L4T
-version, not the Python the device ships, and above all not where a working
-`onnxruntime` comes from. Those were not measurable from the machine this repo was
-written on, and a setup guide that guesses them is worse than one that asks: a
-wrong version number sends an operator looking for a wheel that does not exist
-while the one they have sits unused. §2 is a table for you to fill in; what you
-write there is the thing commit 14 of this milestone puts in
-`edge-agent/pyproject.toml`.
+**This document asserts no version facts about your device.** Not the JetPack
+release, not the L4T version, not the Python it ships, and above all not where a
+working `onnxruntime` comes from. A setup guide that guesses them is worse than
+one that asks: a wrong version number sends an operator looking for a wheel that
+does not exist while the one they have sits unused. §2 is a table for you to
+fill in, and what you write there is what belongs in
+`edge-agent/pyproject.toml`'s comment.
+
+One device has now been measured, and §2 carries it as a clearly-labelled
+**worked example** -- because "the accelerated build comes from NVIDIA" turned
+out to be true and not actionable. It is one Jetson on one day, not a
+requirement, and reading it as a specification is the mistake this paragraph
+exists to prevent.
 
 The acceptance criterion is therefore behavioural, not a version match:
 
@@ -53,8 +58,10 @@ Fill this in on the device, before installing anything. Each command is read-onl
 | CUDA, if present | `nvcc --version` or `ls /usr/local/cuda*` | |
 | is onnxruntime already installed? | `python3 -c 'import onnxruntime as o; print(o.__version__, o.get_available_providers())'` | |
 | where it came from | `python3 -m pip show onnxruntime onnxruntime-gpu 2>/dev/null \| grep -E 'Name\|Version\|Location'` | |
+| the libraries a provider needs | `ls /usr/lib/aarch64-linux-gnu/libcudnn.so* /usr/local/cuda/lib64/libcublas.so* /usr/lib/aarch64-linux-gnu/libnvinfer.so*` | |
+| can this python be installed into at all? | `python3 -m pip --version; ls /usr/lib/python3*/EXTERNALLY-MANAGED` | |
 
-The last two rows are the ones the whole milestone turns on, and the trap is
+The onnxruntime rows are the ones the whole milestone turns on, and the trap is
 specific: **a plain `pip install onnxruntime` gives you a build with no CUDA.** It
 imports, it loads the model, it runs inference, it never errors -- the only
 symptom is the provider list. Read that list rather than the version string, and
@@ -65,10 +72,60 @@ If your `providers` row has no `CUDAExecutionProvider` or
 `TensorrtExecutionProvider` in it, resolve that **before** §3; the agent cannot
 create a provider that the wheel does not have.
 
+The last two rows each explain a missing provider you would otherwise blame on
+the wheel. A provider needs its libraries at *runtime* --
+`CUDAExecutionProvider` wants cuDNN and cuBLAS, `TensorrtExecutionProvider`
+wants `libnvinfer` -- and a provider with no library behind it either drops out
+of the list or imports and dies at the first session (§9 step 5). A system
+python that ships `EXTERNALLY-MANAGED` and no `pip` cannot be installed into at
+all, which decides *where* the wheel goes rather than whether you can have one;
+§3 is where that lands.
+
 The repo's own floor is `requires-python = ">=3.10"`
 (`edge-agent/pyproject.toml`), and it is a floor rather than a pin for exactly
 this reason: the Python that NVIDIA's wheels are built against is the Python this
 agent has to run on, so the agent bends and the wheel does not.
+
+### One device, as a worked example
+
+**Not a specification.** The point of this section is that your device answers
+for itself, and the next Jetson will answer differently. This is here because
+"the accelerated build comes from NVIDIA" was too vague to act on, and because
+the numbers in `edge-agent/pyproject.toml`'s comment should be traceable to the
+commands that produced them.
+
+Measured 2026-10-05 on a Jetson Orin Nano Developer Kit Super: L4T **R39.2.1**
+(the JetPack 7.2 line), Ubuntu **24.04.4**, CUDA **13.2**, system Python
+**3.12.3** with no `pip` and an `EXTERNALLY-MANAGED` marker, cuDNN 9 and cuBLAS
+present, TensorRT absent, and **no onnxruntime of any kind**. What fit:
+
+```
+pip install --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130 onnxruntime-gpu
+```
+
+`onnxruntime-gpu 1.30.0`, cp312, `linux_aarch64`. Two things about that line.
+The distribution is **`onnxruntime-gpu`** -- a different name from the CPU one
+although both import as `onnxruntime`, which is why `edge-agent[onnx]` must not
+be installed on a device. And the path is `sbsa/cu130`, not a `jp7/` path: this
+JetPack is near enough to generic aarch64 plus CUDA 13 that the server-ARM index
+is the one that resolves, so if `jp<n>/cu<m>` gives you nothing, look there
+before concluding that no wheel exists.
+
+Then the check from the table:
+
+```
+python -c "import onnxruntime as o; print(o.get_available_providers())"
+→ ['CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+**which is still not evidence.** That call is what the build *offers*; a
+provider that cannot handle a node falls back to the CPU silently and per-node,
+so the list that settles it is `session.get_providers()` on a real graph.
+Creating a session on a one-`Conv` graph -- `Conv` for the reason §9 step 4
+gives -- reported `['CUDAExecutionProvider', 'CPUExecutionProvider']` and ran one
+inference on a zero input. That is §7's items 3, 4 and 5 proven at the wheel,
+before the agent exists, and it is worth doing in that order: a wheel that fails
+here fails the same way under systemd, with six more moving parts in the way.
 
 ---
 
@@ -89,7 +146,10 @@ Two of those deserve a sentence, because both are silent when wrong:
 * **`--system-site-packages`** is how the venv can see a system-installed
   onnxruntime. An isolated venv hides it, `KEEPER_RUNTIME=onnx` then refuses to
   start, and the natural next move -- `pip install onnxruntime` inside the venv --
-  gets you the CPU-only wheel from §2 and a device that works and is wrong.
+  gets you the CPU-only wheel from §2 and a device that works and is wrong. But
+  on a device with no system installation to see, **the venv turns out to be the
+  right home for the wheel after all**: see below, because what makes that move
+  wrong is the missing index, not the venv.
 * **Group membership, not `PrivateDevices`**, is what grants access to
   `/dev/nvhost-*`. The installer prints the groups it set; `id keeper` and
   `ls -l /dev/nvhost-ctrl` are the two things to compare if §7 fails.
@@ -98,6 +158,29 @@ The installer reports the onnxruntime it can see from inside the venv and warns
 loudly when there is no CUDA or TensorRT provider. It does not refuse to install
 in that case -- that call is yours -- but the warning is the §7 failure, arriving
 early.
+
+### When there is no system onnxruntime to see
+
+§2's last row decides this, and on a JetPack 7-era device it decides it against
+you: the system python is marked `EXTERNALLY-MANAGED` and ships no `pip`, so
+there is no system installation for `--system-site-packages` to expose and no
+supported way to create one. The wheel then goes into the venv the installer
+just built:
+
+```
+sudo /opt/keeper/venv/bin/pip install --index-url <the index §2 found> onnxruntime-gpu
+sudo /opt/keeper/venv/bin/python -c 'import onnxruntime as o; print(o.__version__, o.get_available_providers())'
+```
+
+This is the move §2 calls a trap, with the single difference that makes it
+correct: the index. A bare `pip install onnxruntime` resolves the CPU-only
+distribution from PyPI and nothing downstream will mention it. Install
+`onnxruntime-gpu` from the index your device answered with, then read the
+providers back out of **the venv's own python** -- that is §9 step 1's command,
+and running it once here beats meeting it for the first time while debugging.
+
+`--system-site-packages` stays either way. It costs nothing when there is
+nothing to see, and a device that does have a system installation needs it.
 
 ---
 
@@ -412,11 +495,18 @@ on a disk somewhere stops being able to heartbeat.
 
 ## What this document does not assert
 
-Every version in §2 is **yours**, measured on your device. Nothing here claims a
-JetPack release, a Python version, or a wheel source, because none of those were
-observed from the machine this was written on, and the one that is remembered
-rather than measured -- the Python floor in `edge-agent/pyproject.toml` -- is
-corrected in the next commit with what the device actually reported.
+Every version in §2's **table** is yours, measured on your device. §2's worked
+example is the one exception and says so: it names a JetPack release, a Python
+version and a wheel index because a device was finally in front of this repo, and
+a single measurement is an example of an answer rather than a claim about your
+hardware. Treat it as the shape of one, and expect the numbers to be stale.
+
+The Python floor in `edge-agent/pyproject.toml` is no longer remembered. Its
+comment carries what that device reported and what the previous comment got
+wrong -- which was JetPack 6, Python 3.10 and cp310 wheels, against a device
+that answered JetPack 7.2, Python 3.12 and CUDA 13. The floor itself needed no
+change, and that is the argument for keeping it a floor.
 
 If you find yourself about to add a version number to this file, add the command
-that produced it instead.
+that produced it instead. If you must add the number, say which device and which
+day it came from.

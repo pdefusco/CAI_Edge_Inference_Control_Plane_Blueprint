@@ -2,10 +2,20 @@
 name = "keeper"
 version = "0.1.0"
 description = "Lighthouse edge agent: reconciles local model deployment against CAI desired state"
-# 3.10 because the Jetson is 3.10. JetPack 6 ships Python 3.10 and NVIDIA's
-# accelerated aarch64 onnxruntime wheels are built against it, so requiring 3.11
-# here would mean building onnxruntime from source on-device or giving up the GPU
-# on a device bought for its GPU.
+# A floor, not a pin, because the Python NVIDIA's accelerated aarch64
+# onnxruntime wheels are built against is the Python this agent has to run on:
+# the agent bends and the wheel does not. Requiring 3.11 would mean building
+# onnxruntime from source on-device or giving up the GPU on a device bought for
+# its GPU.
+#
+# Measured 2026-10-05 on a Jetson Orin Nano Developer Kit Super -- L4T R39.2.1
+# (the JetPack 7.2 line), Ubuntu 24.04.4, CUDA 13.2, system Python **3.12.3** --
+# where the accelerated wheel is `onnxruntime-gpu` cp312 for linux_aarch64. An
+# earlier version of this comment asserted "JetPack 6 ships Python 3.10 and the
+# wheels are cp310" from memory, and was wrong about that device by two minor
+# Python versions and a CUDA major. The floor was not: 3.12.3 satisfies `>=3.10`
+# and nothing here had to change to cross a JetPack generation, which is the
+# property worth keeping. Do not narrow it to whatever device is in front of you.
 #
 # This is only true because `contracts/enums.py` carries a StrEnum fallback.
 # Before that fallback existed, this floor said 3.10 while the dependency chain
@@ -24,8 +34,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The real runtime, installed on the device in M4. On Jetson this comes from
-# NVIDIA's wheel index rather than PyPI, so it is not a base dependency.
+# The real runtime, for a laptop or CI. It is not a base dependency because on a
+# Jetson the wheel comes from NVIDIA's index rather than PyPI.
+#
+# **Do not install this extra on a device.** The accelerated build is a
+# different distribution -- `onnxruntime-gpu`, which imports as `onnxruntime`
+# all the same -- so resolving `onnxruntime` here pulls the CPU-only wheel from
+# PyPI alongside it, and the surviving `onnxruntime/` in site-packages decides
+# whether the device has a GPU. That failure is silent in the way
+# docs/jetson-setup.md §2 describes: it imports, it serves, and only the
+# provider list says anything. On a device, install the wheel by itself from the
+# index that §2 names and leave this extra alone.
 onnx = [
     "onnxruntime>=1.17",
     "numpy>=1.24",

@@ -35,7 +35,7 @@ from keeper.runtime.base import (
     ModelRuntime,
     ModelStartError,
 )
-from keeper.runtime.onnx import _PREFERRED_PROVIDERS, _SMOKE_MAX_ELEMENTS, OnnxRuntime
+from keeper.runtime.onnx import _SMOKE_MAX_ELEMENTS, OnnxRuntime
 
 
 # `outputs` has to be settable to `None` itself -- a graph that returns nothing is
@@ -210,15 +210,17 @@ class TestProviderSelection:
     device bought for its GPU.
     """
 
-    def test_it_asks_for_the_available_providers_in_preference_order(
-        self, model_file: Path
-    ) -> None:
+    def test_it_asks_for_the_best_available_accelerator_first(self, model_file: Path) -> None:
         """Preference order is ours, not onnxruntime's.
 
         The available list here is deliberately *reversed* relative to
         `_PREFERRED_PROVIDERS`: an implementation that filtered the available list
         instead of the preference list would pass a plain membership assertion and
         hand ORT `[CPU, CUDA, Tensorrt]`, which prefers the CPU on a Jetson.
+
+        One accelerator per session, not the whole list at once -- see
+        `_open_session`. The happy path still constructs exactly one session,
+        which is the cost this arrangement has to keep down.
         """
         ort = FakeOrt(
             available=[
@@ -228,7 +230,120 @@ class TestProviderSelection:
             ]
         )
         OnnxRuntime(ort=ort).load(str(model_file), name="m", version="1")
-        assert ort.sessions[0].providers == list(_PREFERRED_PROVIDERS)
+        assert ort.sessions[0].providers == ["TensorrtExecutionProvider", "CPUExecutionProvider"]
+        assert len(ort.sessions) == 1
+
+    def test_a_missing_tensorrt_does_not_cost_the_device_cuda(self, model_file: Path) -> None:
+        """The bug this tier structure exists for, measured on an Orin Nano.
+
+        `TensorrtExecutionProvider` is in `get_available_providers()` on a box
+        with no libnvinfer at all. Handed `[Tensorrt, CUDA, CPU]`, onnxruntime
+        prints an `EP Error`, **raises nothing**, and returns a session that has
+        quietly dropped CUDA too -- so the device ran a governed model on its CPU
+        while reporting RUNNING. The fake reproduces the shape of that: a session
+        that accepts the request and then reports only CPU.
+        """
+        ort = FakeOrt(
+            available=[
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        )
+        collapse = {"TensorrtExecutionProvider"}
+
+        original = ort.InferenceSession
+
+        def falls_back(path: str, *args: Any, providers: Any = None, **kw: Any) -> Any:
+            session = original(path, *args, providers=providers, **kw)
+            if collapse & set(providers or ()):
+                session.providers = ["CPUExecutionProvider"]
+            return session
+
+        ort.InferenceSession = falls_back  # type: ignore[method-assign]
+
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+
+        assert ort.sessions[0].providers == ["CPUExecutionProvider"]  # the collapsed attempt
+        assert ort.sessions[1].providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        info = runtime.hardware_info()
+        assert info["active_providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        # And it says why, so a CPU_ONLY fleet row is answerable without SSH.
+        assert any("TensorrtExecutionProvider" in n for n in info["provider_fallbacks"])
+
+    def test_an_accelerator_that_raises_falls_to_the_next_one(self, model_file: Path) -> None:
+        """The other half: some builds raise from the constructor instead of
+        falling back silently. Same outcome required -- CUDA, not CPU."""
+        ort = FakeOrt(
+            available=[
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        )
+        original = ort.InferenceSession
+
+        def raises_for_trt(path: str, *args: Any, providers: Any = None, **kw: Any) -> Any:
+            if "TensorrtExecutionProvider" in (providers or ()):
+                raise RuntimeError("Please install TensorRT libraries")
+            return original(path, *args, providers=providers, **kw)
+
+        ort.InferenceSession = raises_for_trt  # type: ignore[method-assign]
+
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+
+        info = runtime.hardware_info()
+        assert info["active_providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert "install TensorRT libraries" in info["provider_fallbacks"][0]
+
+    def test_every_accelerator_failing_still_loads_on_the_cpu(self, model_file: Path) -> None:
+        """A device whose GPU is unusable must still serve, and must still say so.
+
+        Refusing to load would take the model offline over a *degradation*; the
+        acceleration field and `provider_fallbacks` carry the bad news instead,
+        and the control plane decides what a CPU_ONLY device is worth.
+        """
+        ort = FakeOrt(available=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        original = ort.InferenceSession
+
+        def cpu_only(path: str, *args: Any, providers: Any = None, **kw: Any) -> Any:
+            session = original(path, *args, providers=providers, **kw)
+            session.providers = ["CPUExecutionProvider"]
+            return session
+
+        ort.InferenceSession = cpu_only  # type: ignore[method-assign]
+
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+
+        assert ort.sessions[-1].path == str(model_file)
+        info = runtime.hardware_info()
+        assert info["active_providers"] == ["CPUExecutionProvider"]
+        assert len(info["provider_fallbacks"]) == 1
+
+    def test_provider_notes_do_not_survive_a_clean_load(self, model_file: Path) -> None:
+        """A hot-swap onto a build that works must not keep the old complaint --
+        the same reason `_smoke_status` resets, one field over."""
+        ort = FakeOrt(available=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        original = ort.InferenceSession
+        broken = True
+
+        def sometimes(path: str, *args: Any, providers: Any = None, **kw: Any) -> Any:
+            session = original(path, *args, providers=providers, **kw)
+            if broken:
+                session.providers = ["CPUExecutionProvider"]
+            return session
+
+        ort.InferenceSession = sometimes  # type: ignore[method-assign]
+        runtime = OnnxRuntime(ort=ort)
+        runtime.load(str(model_file), name="m", version="1")
+        assert runtime.hardware_info()["provider_fallbacks"]
+
+        broken = False
+        runtime.load(str(model_file), name="m", version="2")
+        assert "provider_fallbacks" not in runtime.hardware_info()
 
     def test_it_drops_providers_this_build_does_not_have(self, model_file: Path) -> None:
         """Plain `onnxruntime` exposes only CPU; `onnxruntime-gpu` on Jetson adds

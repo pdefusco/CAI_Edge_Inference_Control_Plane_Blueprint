@@ -159,6 +159,10 @@ class OnnxRuntime:
         # Reported in every heartbeat, so a device that is RUNNING-but-unproven
         # is visible as such rather than indistinguishable from a proven one.
         self._smoke_status = "not run"
+        # Why the accelerator this build advertises is not the one serving, when
+        # that happens. Also reported in the heartbeat: a device that fell back
+        # to its CPU should not require an SSH session to find out why.
+        self._provider_notes: list[str] = []
 
     @property
     def name(self) -> str:
@@ -203,16 +207,7 @@ class OnnxRuntime:
         if path.stat().st_size == 0:
             raise ModelLoadError(f"ONNX file is empty: {path}")
 
-        available = set(self._ort.get_available_providers())
-        providers = [p for p in _PREFERRED_PROVIDERS if p in available] or ["CPUExecutionProvider"]
-
-        try:
-            session = self._ort.InferenceSession(str(path), providers=providers)
-        except Exception as exc:
-            # onnxruntime raises a variety of its own exception types for a bad
-            # opset or an unsupported op. Normalised here so the reconciler only
-            # has to know about ModelLoadError.
-            raise ModelLoadError(f"onnxruntime could not load {path}: {exc}") from exc
+        session, notes = self._open_session(path)
 
         # Swap in only after a successful load, so a failed upgrade leaves the
         # previously-working session serving rather than tearing it down first.
@@ -226,6 +221,9 @@ class OnnxRuntime:
         # "passed" across a hot-swap would report the *previous* model's
         # successful inference as evidence for this one.
         self._smoke_status = "not run"
+        self._provider_notes = notes
+        for note in notes:
+            log.warning("provider unavailable for %s/%s -- %s", name, version, note)
         log.info(
             "loaded %s/%s with providers %s (input=%s)",
             name,
@@ -233,6 +231,69 @@ class OnnxRuntime:
             session.get_providers(),
             self._input_name,
         )
+
+    def _open_session(self, path: Path) -> tuple[Any, list[str]]:
+        """Construct a session on the best accelerator that actually works.
+
+        One `InferenceSession` per candidate accelerator -- `[Tensorrt, CPU]`,
+        then `[CUDA, CPU]`, then `[CPU]` -- rather than handing onnxruntime the
+        whole preference list at once. That costs a second construction on a
+        device where the first accelerator is broken, and it is the only way to
+        get the behaviour this fleet needs, because onnxruntime's own fallback is
+        *all-or-nothing*: asked for `[Tensorrt, CUDA, CPU]` on a box with no
+        TensorRT libraries it prints an `EP Error`, discards **CUDA along with
+        TensorRT**, and retries on `['CPUExecutionProvider']` alone.
+        Measured on the Orin Nano 2026-10-04 with onnxruntime-gpu 1.24.0 and no
+        libnvinfer installed: a GPU device served every inference on its CPU,
+        and `TensorrtExecutionProvider` was in `get_available_providers()` the
+        whole time. Availability is not usability.
+
+        And none of that raises. The fallback happens inside the constructor, so
+        the `except` below never sees it and the only evidence is the returned
+        session's own provider list -- hence the check on it rather than trust in
+        a successful construction. `disable_fallback()` would make the failure
+        loud, but it lives on a session that does not exist yet.
+
+        What this does NOT prove is that the accelerator can execute the graph.
+        `get_providers()` has been measured lying about exactly that -- it
+        reported CUDA on a session whose first `Gemm` then died with
+        `cudaErrorNoKernelImageForDevice`, the wheel having been built for the
+        wrong compute capability. An inference that completes is the only honest
+        answer, which is the smoke check's job in `start()`, not this method's.
+        """
+        available = set(self._ort.get_available_providers())
+        accelerators = [
+            p for p in _PREFERRED_PROVIDERS if p in available and p != "CPUExecutionProvider"
+        ]
+
+        notes: list[str] = []
+        for accel in accelerators:
+            # CPU kept in every candidate list as the within-session fallback for
+            # individual nodes the accelerator has no kernel for, which is normal
+            # and not a degradation. It is the *whole session* silently becoming
+            # CPU-only that this loop exists to catch.
+            try:
+                session = self._ort.InferenceSession(
+                    str(path), providers=[accel, "CPUExecutionProvider"]
+                )
+            except Exception as exc:
+                notes.append(f"{accel}: {type(exc).__name__}: {exc}")
+                continue
+            if accel in session.get_providers():
+                return session, notes
+            notes.append(
+                f"{accel}: onnxruntime accepted the session and then fell back to "
+                f"{session.get_providers()} -- its libraries are probably missing"
+            )
+
+        try:
+            session = self._ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        except Exception as exc:
+            # onnxruntime raises a variety of its own exception types for a bad
+            # opset or an unsupported op. Normalised here so the reconciler only
+            # has to know about ModelLoadError.
+            raise ModelLoadError(f"onnxruntime could not load {path}: {exc}") from exc
+        return session, notes
 
     def start(self) -> None:
         """Begin serving -- after proving the graph can actually execute.
@@ -344,6 +405,7 @@ class OnnxRuntime:
         self._model = None
         self._input_names = ()
         self._smoke_status = "not run"
+        self._provider_notes = []
 
     @property
     def is_running(self) -> bool:
@@ -397,6 +459,12 @@ class OnnxRuntime:
                 info["active_providers"] = self._session.get_providers()
             except Exception:  # pragma: no cover - never break a heartbeat
                 pass
+        # Why an advertised accelerator is not in `active_providers`, when one is
+        # missing. Without this the fleet view can say a GPU device is CPU_ONLY
+        # but not why, and the answer -- a missing TensorRT library, a wheel built
+        # for the wrong compute capability -- is only in the device's journal.
+        if self._provider_notes:
+            info["provider_fallbacks"] = list(self._provider_notes)
         # Jetson identifies itself here; absent on anything else.
         model_file = Path("/proc/device-tree/model")
         try:

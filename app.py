@@ -123,6 +123,67 @@ def _listening(proc: Path) -> dict[int, set[str]]:
     return ports
 
 
+def _mask(hex_addr: str) -> str:
+    """Decode a `/proc/net/tcp` local address, masking anything routable.
+
+    The three answers that matter are `0.0.0.0` (nobody else can have this
+    port), `127.0.0.1` (the port is only taken on loopback, so the pod's own
+    interface may still be bindable) and everything else. Only the first two are
+    printed literally. A pod IP is private tenant data and must not reach a log
+    someone pastes into an issue, so it comes back as `<pod-ip>` --
+    `_port_report` already learned that lesson the expensive way.
+    """
+    try:
+        if len(hex_addr) == 8:
+            ip = ".".join(str(b) for b in reversed(bytes.fromhex(hex_addr)))
+        elif len(hex_addr) == 32:
+            # Four 32-bit words, each little-endian within the word.
+            raw = b"".join(
+                bytes.fromhex(hex_addr[i : i + 8])[::-1] for i in range(0, 32, 8)
+            )
+            ip = socket.inet_ntop(socket.AF_INET6, raw)
+        else:
+            return "<unparsed>"
+    except (ValueError, OSError):
+        return "<unparsed>"
+    if ip in ("0.0.0.0", "::"):
+        return ip
+    if ip.startswith("127.") or ip in ("::1", "::ffff:127.0.0.1"):
+        return ip
+    return "<pod-ip>"
+
+
+def _listen_addrs(proc: Path) -> dict[int, set[str]]:
+    """Every listening port mapped to the masked addresses it is bound to.
+
+    Separate from `_listening` because the two answer different questions: that
+    one finds who owns a port, this one finds *where* they bound it, and the
+    second is what decides whether the port is winnable at all. Observed
+    2026-10-04: a wildcard holder cannot be worked around, a loopback-only
+    holder can -- on Linux, binding a specific non-loopback address succeeds
+    while another socket holds a different specific address on the same port.
+    """
+    addrs: dict[int, set[str]] = {}
+    for name in ("net/tcp", "net/tcp6"):
+        try:
+            lines = (proc / name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) <= 9 or fields[3] != "0A":
+                continue
+            local = fields[1].rsplit(":", 1)
+            if len(local) != 2:
+                continue
+            try:
+                port = int(local[1], 16)
+            except ValueError:
+                continue
+            addrs.setdefault(port, set()).add(_mask(local[0]))
+    return addrs
+
+
 def _owner(inodes: set[str], proc: Path) -> str:
     """`pid N (cmdline)` for whichever visible process holds one of `inodes`."""
     if not inodes:
@@ -167,7 +228,10 @@ def _port_holder(port: int, *, proc: Path = Path("/proc")) -> str:
     """
     try:
         holder = _owner(_listening(proc).get(port, set()), proc)
-        return f"held by {holder}" if holder else ""
+        where = ", ".join(sorted(_listen_addrs(proc).get(port, set())))
+        if not holder:
+            return f"bound on {where}" if where else ""
+        return f"held by {holder}" + (f", bound on {where}" if where else "")
     except Exception:  # noqa: BLE001 -- never let the diagnostic mask the error
         return ""
 
@@ -203,10 +267,12 @@ def _port_report(*, proc: Path = Path("/proc")) -> list[str]:
             )
         table = _listening(proc)
         if table:
+            where = _listen_addrs(proc)
             lines.append("  listening in this container:")
             for port in sorted(table):
                 owner = _owner(table[port], proc) or "owner unknown"
-                lines.append(f"    {port} -- {owner}")
+                on = ", ".join(sorted(where.get(port, set()))) or "?"
+                lines.append(f"    {port} on {on} -- {owner}")
     except Exception:  # noqa: BLE001 -- a diagnostic must not mask the error
         return lines
     return lines
@@ -215,23 +281,31 @@ def _port_report(*, proc: Path = Path("/proc")) -> list[str]:
 def _app_service_ports() -> list[tuple[str, str]]:
     """Ports that Kubernetes service discovery calls an **app** service port.
 
-    The repair for a `CDSW_APP_PORT` that does not name the Application's port.
-    Observed 2026-10-04 in a deployed Application: all three of `CDSW_APP_PORT`,
-    `CDSW_PUBLIC_PORT` and `CDSW_READONLY_PORT` read **8100**, which the same
-    environment identifies as the *read-only* port --
+    A last resort that buys a *live process*, not a reachable one. Do not read
+    the name as authority. Observed 2026-10-04 in a deployed Application: all
+    three of `CDSW_APP_PORT`, `CDSW_PUBLIC_PORT` and `CDSW_READONLY_PORT` read
+    **8100**, while the same environment says
 
         DS_RUNTIME_<id>_SERVICE_PORT_APP=8090
         DS_RUNTIME_<id>_SERVICE_PORT_READ_ONLY=8100
+        DS_RUNTIME_<id>_SERVICE_PORT_PUBLIC=8080
 
-    -- so every variable `main.py` and the fallback above know about pointed at
-    the port the engine serves JupyterLab on, and 8090 sat free and unexamined.
+    which reads like a correction and is not one. `CDSW_PUBLIC_PORT` is 8100
+    against a service calling `public` 8080, and *nobody set it* -- not the
+    Application's environment variables, not the Project's. **The two
+    vocabularies are unrelated**: `SERVICE_PORT_*` describes the Kubernetes
+    service, `CDSW_*` the single port the engine proxies a workload through.
+    They share the word "app" by coincidence, and reading the mismatch as an
+    override cost a wasted round trip (`docs/cai-deployment.md` §3).
 
-    Kubernetes injects these for every service in the namespace, so the value
-    found may belong to a *sibling* workload rather than this one. That is
-    sound: the port scheme is a property of the CAI runtime, not of one
-    workload. It is still only a candidate -- the bind decides, and the caller
-    says loudly when the winner came from here, because a port CAI does not
-    route to produces an app that looks healthy and answers nobody.
+    So 8100 is where CAI routes, and binding 8090 instead moves the process
+    *away* from the route: measured, that yields an `istio-envoy` 502 with
+    `content-length: 0` while uvicorn logs a healthy start. Kubernetes injects
+    these variables for every service in the namespace, so the value found may
+    belong to a sibling workload -- here 8090 did, a Session's. The bind still
+    decides, and the caller says loudly when the winner came from here, because
+    this is the candidate that produces an app which looks healthy and answers
+    nobody.
     """
     found: dict[int, str] = {}
     for name, value in sorted(os.environ.items()):
@@ -257,25 +331,30 @@ def _pick_port() -> None:
 
     The fallback to `CDSW_READONLY_PORT` comes from a sibling blueprint
     (`CAI_Agentic_NBA_Observability_Blueprint`, `launch_app.py`), which serves a
-    FastAPI app from a CAI Application by binding `$CDSW_READONLY_PORT`. It
-    cannot help when the two variables name the *same* port, which is what was
-    observed here -- both 8100, and 8100 is the read-only port. `0.0.0.0` is
-    kept for the probe even though that blueprint binds loopback: on Linux a
-    loopback bind fails `EADDRINUSE` against a wildcard holder just the same, so
-    it would not rescue a taken port, and only `0.0.0.0` is reachable from a
-    proxy in another container.
+    FastAPI app from a CAI Application by binding `$CDSW_READONLY_PORT` and
+    works on this same runtime -- which means that there, the two variables hold
+    *different* values. Here they have collapsed onto one, both 8100, and the
+    fallback has nowhere to go. Why they collapsed is the open question
+    (`docs/cai-deployment.md` §3); setting `CDSW_READONLY_PORT` by hand to the
+    sibling's value reproduces its working configuration and is the cheap test.
+    `0.0.0.0` is kept for the probe even though that blueprint binds loopback:
+    on Linux a loopback bind fails `EADDRINUSE` against a wildcard holder just
+    the same, so it would not rescue a taken port, and only `0.0.0.0` is
+    reachable from a proxy in another container.
 
     So there is a third candidate, `_app_service_ports()`, which reads the port
-    Kubernetes service discovery *calls* the app port. It is last because it can
-    name a sibling workload's service, and the two CAI variables are right
-    whenever they are right. See `docs/cai-deployment.md` §3.
+    Kubernetes service discovery *calls* the app port. It is last and it is not
+    a repair -- measured, its 8090 is bindable and routes to nobody. It exists
+    to turn a crash into a live process that can be probed. See
+    `docs/cai-deployment.md` §3.
 
-    Hardcoding the read-only port would just move the breakage: both variables
-    are set either way, so a plain-process Application would then bind a port
-    nothing routes to and look healthy while being unreachable. Binding is the
-    only test that distinguishes them, so that is the test -- preferring
-    `CDSW_APP_PORT` and falling back only when it is genuinely taken, which
-    needs no knowledge of which runtime kind this is.
+    Hardcoding any one of these just moves the breakage, because "it bound" and
+    "it is reachable" are different facts and only the first is testable from
+    inside the container. Binding is still the only test available, so that is
+    the test -- preferring `CDSW_APP_PORT`, which is the port CAI routes to, and
+    falling back only when it is genuinely taken. That needs no knowledge of
+    which runtime kind this is, and when the fallback wins it says so loudly,
+    because a win there means the app is up and unreachable.
 
     An explicit `PORT` disables the probe entirely, because silently overriding
     one would be a bug: `CDSW_READONLY_PORT` is set in a *Session* too, so the
@@ -323,14 +402,25 @@ def _pick_port() -> None:
                 file=sys.stderr,
             )
         if name in discovered:
-            # Worth a line of its own: this is the candidate that can be wrong
-            # in the quiet direction. If the app starts and `probe_app.py` still
-            # cannot reach it, this is the first thing to suspect.
+            # The candidate that can be wrong in the quiet direction, so it
+            # gets the full dump rather than one line. Observed 2026-10-04: this
+            # path produced a process that served happily on 8090 while the
+            # public URL returned a 502 from the ingress, and the dump was
+            # unavailable precisely because nothing had *failed*. Whether the
+            # engine's hold on the routed port is on `0.0.0.0` or only on
+            # loopback decides whether that port is winnable at all, and that is
+            # in this table.
             print(
-                f"serving on {port}, taken from {name} because no CDSW_* port"
-                " variable named a port that could be bound. If the public URL"
-                " does not reach this, the Application's port variables are"
-                " overridden -- see `docs/cai-deployment.md` §3.",
+                "\n".join(
+                    [
+                        f"serving on {port}, taken from {name} because no CDSW_*"
+                        " port variable named a port that could be bound. CAI"
+                        " does not route the Application's URL here, so expect"
+                        " a 502 from the ingress until the routed port is"
+                        " winnable -- see `docs/cai-deployment.md` §3.",
+                        *_port_report(),
+                    ]
+                ),
                 file=sys.stderr,
             )
         # Handed over as `PORT` with `CDSW_APP_PORT` cleared, which is how

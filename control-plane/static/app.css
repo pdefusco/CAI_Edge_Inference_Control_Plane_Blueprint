@@ -31,6 +31,28 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute is how every toggle on this page works -- `show()` in
+   app.js sets nothing but `node.hidden`. It needs this rule to survive, because
+   `hidden` is only `display: none` in the *user-agent* stylesheet, and any
+   author rule that sets `display` on the same element beats it regardless of
+   specificity: author origin outranks UA origin.
+
+   Observed 2026-10-04 in a deployed Application, which is what this rule is for.
+   `main { display: grid }` and `.gate { display: grid }` silently cancelled
+   `hidden` on `#main` and `#gate` -- the two elements the session gate toggles --
+   so the operator sign-in panel stayed on screen after a successful sign-in and
+   the console chrome rendered for signed-out visitors. No data leaked (every
+   data route takes `require_operator`), but a page that shows a console to
+   someone who is not signed in and a login form to someone who is tells the
+   operator the opposite of the truth twice over.
+
+   `!important` rather than more specific selectors, because the failure is not
+   "this element needs fixing" but "any future `display` rule re-breaks the
+   toggle, invisibly, at a distance". */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   background: var(--bg);

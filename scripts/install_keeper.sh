@@ -124,21 +124,37 @@ if "$VENV/bin/python" -c 'import onnxruntime' >/dev/null 2>&1; then
   version="$("$VENV/bin/python" -c 'import onnxruntime; print(onnxruntime.__version__)')"
   providers="$("$VENV/bin/python" -c 'import onnxruntime; print(" ".join(onnxruntime.get_available_providers()))')"
   say "onnx      onnxruntime $version"
-  say "          providers: $providers"
+  # "advertised", not "providers", because this list is a claim about the build
+  # and not about this device. Measured on an Orin Nano 2026-10-04: the aarch64
+  # onnxruntime-gpu wheel advertises TensorrtExecutionProvider with no libnvinfer
+  # installed anywhere, so the old spelling of this line printed
+  # "providers: Tensorrt CUDA CPU" -- reassuringly, past a check that then found
+  # nothing to warn about -- on a device that could not use TensorRT at all.
+  say "          advertised: $providers"
   case "$providers" in
-    *CUDAExecutionProvider* | *TensorrtExecutionProvider*) ;;
+    # CUDA only. TensorRT's presence here is uninformative for the reason above,
+    # so accepting it as evidence of acceleration is how a device with an
+    # unusable accelerator gets a clean install report. A box with working
+    # TensorRT also has CUDA, so nothing real is lost by ignoring it.
+    *CUDAExecutionProvider*) ;;
     *)
       # Not fatal here. The agent will start and serve on the CPU, and that is a
       # decision for whoever is standing in front of the device -- but it is the
       # failure this whole milestone is about, so it does not get to be quiet.
       say ""
-      say "          WARNING: no CUDA or TensorRT provider. The agent will run this"
+      say "          WARNING: no CUDA provider advertised. The agent will run this"
       say "          device's models on its CPU. docs/jetson-setup.md covers the"
       say "          wheel situation; a GPU device serving on the CPU is a failed"
       say "          acceptance check, not a working install."
       say ""
       ;;
   esac
+  # And advertised CUDA is still not a working GPU. The wheel has to carry cubins
+  # for this device's compute capability, which is a fact about the file and is
+  # checkable right now -- unlike the provider list, which has been measured
+  # lying in both directions. docs/jetson-setup.md section 2 has the cuobjdump
+  # one-liner; the agent's smoke check is the backstop when nobody ran it.
+  say "          (advertised is not usable: see docs/jetson-setup.md section 2)"
 else
   say "onnx      onnxruntime is NOT importable in $VENV"
   say "          KEEPER_RUNTIME=onnx will exit 2 until it is. See docs/jetson-setup.md."

@@ -68,9 +68,13 @@ symptom is the provider list. Read that list rather than the version string, and
 read it sceptically: on the laptop this repo was written on, the same check
 reports `AzureExecutionProvider`, which is a *remote* inference endpoint and not
 local acceleration at all. The accelerated aarch64 build comes from NVIDIA.
-If your `providers` row has no `CUDAExecutionProvider` or
-`TensorrtExecutionProvider` in it, resolve that **before** §3; the agent cannot
-create a provider that the wheel does not have.
+If your `providers` row has no `CUDAExecutionProvider` in it, resolve that
+**before** §3; the agent cannot create a provider that the wheel does not have.
+
+Read that row for CUDA specifically, and treat `TensorrtExecutionProvider` in it
+as meaning nothing at all. Measured 2026-10-04: the aarch64 `onnxruntime-gpu`
+wheel advertises TensorRT on a device with no `libnvinfer` anywhere on it. The
+row is a property of the build, not of your device.
 
 The last two rows each explain a missing provider you would otherwise blame on
 the wheel. A provider needs its libraries at *runtime* --
@@ -100,32 +104,101 @@ Measured 2026-10-05 on a Jetson Orin Nano Developer Kit Super: L4T **R39.2.1**
 present, TensorRT absent, and **no onnxruntime of any kind**. What fit:
 
 ```
-pip install --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130 onnxruntime-gpu
+pip install --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130 'onnxruntime-gpu==1.24.0'
 ```
 
-`onnxruntime-gpu 1.30.0`, cp312, `linux_aarch64`. Two things about that line.
+`onnxruntime-gpu 1.24.0`, cp312, `linux_aarch64`. Three things about that line.
+
 The distribution is **`onnxruntime-gpu`** -- a different name from the CPU one
 although both import as `onnxruntime`, which is why `edge-agent[onnx]` must not
-be installed on a device. And the path is `sbsa/cu130`, not a `jp7/` path: this
+be installed on a device. The path is `sbsa/cu130`, not a `jp7/` path: this
 JetPack is near enough to generic aarch64 plus CUDA 13 that the server-ARM index
 is the one that resolves, so if `jp<n>/cu<m>` gives you nothing, look there
 before concluding that no wheel exists.
 
-Then the check from the table:
+**And the version pin is load-bearing.** Without it this exact command installs
+`1.30.0` and the device cannot run a model, which is how this paragraph was
+written: `sbsa/cu130` inherits a PyPI mirror, so pip sees both the channel's own
+Jetson build (`1.24.0-cp312-cp312-linux_aarch64`) and a generic server-ARM wheel
+(`1.30.0-manylinux_2_34_aarch64`, built for Grace/Ada/Hopper/Blackwell), and the
+higher version wins. The index is necessary and not sufficient.
+
+### The check that actually decides it
+
+A CUDA wheel carries compiled GPU kernels (cubins), and they are built for
+specific **compute capabilities**. An Orin is `sm_87`. A wheel without `sm_87`
+in it imports fine, advertises `CUDAExecutionProvider`, creates a session that
+*reports* CUDA, and then dies at the first node CUDA actually runs:
 
 ```
-python -c "import onnxruntime as o; print(o.get_available_providers())"
-→ ['CUDAExecutionProvider', 'CPUExecutionProvider']
+CUDA error cudaErrorNoKernelImageForDevice:no kernel image is available
+for execution on the device
 ```
 
-**which is still not evidence.** That call is what the build *offers*; a
-provider that cannot handle a node falls back to the CPU silently and per-node,
-so the list that settles it is `session.get_providers()` on a real graph.
-Creating a session on a one-`Conv` graph -- `Conv` for the reason §9 step 4
-gives -- reported `['CUDAExecutionProvider', 'CPUExecutionProvider']` and ran one
-inference on a zero input. That is §7's items 3, 4 and 5 proven at the wheel,
-before the agent exists, and it is worth doing in that order: a wheel that fails
-here fails the same way under systemd, with six more moving parts in the way.
+This is knowable from the file, before installing anything:
+
+```
+so=$(python -c "import onnxruntime,os;print(os.path.dirname(onnxruntime.__file__))")/capi/libonnxruntime_providers_cuda.so
+/usr/local/cuda/bin/cuobjdump --list-elf "$so" | grep -oE 'sm_[0-9]+' | sort -u
+```
+
+Measured 2026-10-04 on the two candidates, which is the whole argument for the
+pin and against the obvious alternative:
+
+| wheel | cubins | links |
+|---|---|---|
+| `sbsa/cu130` 1.30.0 | sm_89 sm_90 sm_120 sm_121 | `libcudart.so.13` |
+| `sbsa/cu130` **1.24.0** | **sm_87** sm_110 sm_120 sm_121 | `libcudart.so.13` ✓ |
+| `jp6/cu129` 1.23.0 | **sm_87** | `libcudart.so.12` ✗ |
+
+The `jp6` wheel has the right kernels and the wrong CUDA major -- this device
+ships only `libcudart.so.13` -- so "find a JetPack wheel" is not the rule
+either. Both halves have to match. To run the check *before* committing to an
+install, `pip download --index-url <index> 'onnxruntime-gpu==<v>'` and
+`unzip -o` the wheel into a scratch directory; `cuobjdump` reads the `.so` out
+of there just the same.
+
+### Three things that look like proof and are not
+
+In order of how convincing they are, which is the reverse of how much they are
+worth:
+
+1. **`get_available_providers()`** says what the build offers. It listed
+   `CUDAExecutionProvider` for the 1.30.0 wheel that had no kernels for this
+   board, and lists `TensorrtExecutionProvider` on a device with no TensorRT.
+2. **`session.get_providers()`** says what a *constructed session* holds -- and
+   it lied too. On 1.30.0 it reported `['CUDAExecutionProvider',
+   'CPUExecutionProvider']`, and the first `Gemm` then failed with the error
+   above. An earlier draft of this section named this call as the one that
+   settles it. It does not.
+3. **An inference that completes** is the only honest answer, and even then only
+   for nodes the session actually assigned to CUDA. The one-`Conv` probe this
+   section used to recommend passed on the broken wheel, because that single
+   node fell back to the CPU without a word. Use a graph with a `Gemm` or
+   `MatMul` in it, or just let the agent's own smoke check (§7 item 5) be the
+   gate -- it runs a real inference before reporting `RUNNING`, and on the
+   broken wheel it turned what would have been a confident `RUNNING /
+   ACCELERATED` into a loud `FAILED` carrying the CUDA error.
+
+### The TensorRT trap, which costs you CUDA and not TensorRT
+
+Because the wheel advertises TensorRT unconditionally, asking onnxruntime for
+`[Tensorrt, CUDA, CPU]` on a device with no `libnvinfer` prints an `EP Error`,
+**raises nothing**, and retries on `['CPUExecutionProvider']` alone -- discarding
+CUDA on the way down. The result is a GPU device serving every inference on its
+CPU while reporting `RUNNING` and passing its smoke check, because running on
+the CPU is not a failure, only a lie.
+
+The agent handles this (`edge-agent/src/keeper/runtime/onnx.py`, `_open_session`):
+it offers one accelerator at a time and checks what came back, so a missing
+TensorRT costs you TensorRT. You will still see the `EP Error` block in the
+journal on a device without it -- that is onnxruntime narrating the first
+attempt, and the line after it is the one to read. Installing TensorRT is not
+required for the acceleration gate; CUDA satisfies it.
+
+Measured 2026-10-04, end to end on the device described above: `loaded
+smoke-test/1 with providers ['CUDAExecutionProvider', 'CPUExecutionProvider']`,
+the smoke inference completed, and `make fleet` showed `ACCELERATED`.
 
 ---
 
@@ -379,16 +452,26 @@ gave a `sqlite3` snippet to read `actual_deployment.hardware_json` by hand. That
 gap is closed; the snippet is gone because it was reading a column that the API
 now serves verbatim.
 
-The two fields that matter inside `hardware`:
+The fields that matter inside `hardware`:
 
-* **`active_providers`** -- what the loaded session is *actually* using. This is
-  the gate. `providers` next to it only says what the installed build *could* do,
-  and the difference is the whole problem: a provider that cannot handle a node
-  falls back to the CPU silently and per-node, so a device can report CUDA as
+* **`active_providers`** -- what the loaded session is *actually* using.
+  `providers` next to it only says what the installed build *could* do, and the
+  difference is most of the problem: a provider that cannot handle a node falls
+  back to the CPU silently and per-node, so a device can report CUDA as
   available while running the model on its CPU.
 * **`smoke_check`** -- `passed`, `not run`, `disabled`, `skipped: <why>` or
   `failed: <why>`. A `RUNNING` device whose check was skipped has not been proven
   to execute anything, and that is a different claim from a proven one.
+* **`provider_fallbacks`** -- present only when an advertised accelerator was
+  asked for and did not materialise, saying which and why (a missing TensorRT
+  library, typically). This is the field that makes a `CPU_ONLY` row answerable
+  without an SSH session.
+
+**Read the first two together; neither is the gate alone.** `active_providers`
+naming CUDA has been measured on a session that could not execute a `Gemm` --
+§2's "three things that look like proof" has the detail -- so `ACCELERATED` with
+`smoke_check: passed` is the pair that means something. `ACCELERATED` with a
+skipped check is a claim about configuration, not about silicon.
 
 Finally, prove the control plane can take it away again:
 
@@ -436,17 +519,32 @@ In order, because each step rules out the one below it:
    providers are CPU-only here, nothing about the unit is involved -- you are in
    §2's trap, and the fix is the wheel. The `__file__` says whether the venv is
    seeing the system installation or a pip copy that shadowed it.
-2. **Is it device access?** `id keeper` against `ls -l /dev/nvhost-ctrl
+2. **Does that wheel have kernels for *this* board?** This is the step that is
+   easiest to skip and most likely to be the answer, because the wheel passes
+   step 1 while failing it. Run §2's `cuobjdump --list-elf | grep sm_` one-liner
+   and look for your board's compute capability (`sm_87` on an Orin). A wheel
+   without it reports CUDA everywhere and dies at the first GPU node with
+   `cudaErrorNoKernelImageForDevice`, which lands in the journal as a `FAILED`
+   deployment rather than as a CPU-only provider list.
+3. **Did TensorRT take CUDA down with it?** An `EP Error ... Please install
+   TensorRT libraries` block in the journal is expected on a device without
+   TensorRT and is not itself the problem; the line *after* it says what loaded.
+   If that line reports CPU-only, the agent is older than the fix in
+   `_open_session` -- see §2's "TensorRT trap".
+4. **Is it device access?** `id keeper` against `ls -l /dev/nvhost-ctrl
    /dev/nvmap`. A missing group is the installer's job and it prints what it did;
    a missing device node is a driver or boot problem and not an agent problem.
-3. **Is it the sandbox?** Comment out the hardening block wholesale, restart, and
+5. **Is it the sandbox?** Comment out the hardening block wholesale, restart, and
    re-read the list. If it comes back, bisect with §8.
-4. **Is it the graph?** `active_providers` is per-session. A provider that cannot
+6. **Is it the graph?** `active_providers` is per-session. A provider that cannot
    handle a node falls back silently, so a graph of unsupported ops yields a CUDA
    build serving on the CPU. The repo's fixture graph keeps a `Conv` specifically
-   because `Conv` is the op that exercises CUDA and TensorRT -- if the fixture gets
-   a GPU provider and your model does not, the answer is in your model's ops.
-5. **Does the library load at all?** A wheel built against a CUDA the device does
+   because `Conv` is an op CUDA and TensorRT have kernels for -- if the fixture
+   gets a GPU provider and your model does not, the answer is in your model's
+   ops. Note what this does *not* establish: a one-`Conv` graph loaded on the
+   wrong-architecture wheel ran a clean inference, because that node fell back to
+   the CPU without a word. A passing probe is weaker evidence than a failing one.
+7. **Does the library load at all?** A wheel built against a CUDA the device does
    not have imports and then dies on `libcublas.so`. That failure is caught around
    the runtime construction in `main.py` and exits 2 with the message, so check
    `systemctl status keeper` before assuming a silent fallback.
@@ -506,6 +604,17 @@ comment carries what that device reported and what the previous comment got
 wrong -- which was JetPack 6, Python 3.10 and cp310 wheels, against a device
 that answered JetPack 7.2, Python 3.12 and CUDA 13. The floor itself needed no
 change, and that is the argument for keeping it a floor.
+
+Two claims this file made confidently were falsified by the first real bring-up,
+and both are kept visible above rather than quietly replaced, because the shape
+of the mistake is the useful part. It recommended the `sbsa/cu130` index
+**unpinned**, which installs a wheel with no kernels for an Orin; and it named
+`session.get_providers()` as the call that settles whether the GPU is real, when
+that call reported CUDA on a session that could not execute a `Gemm`. Both were
+reasonable inferences from a working command on a laptop. Neither survived the
+device, and in both cases the thing that caught it was a check that insisted on
+an *outcome* -- a completed inference, a cubin in a file -- over a status that
+something reported about itself.
 
 If you find yourself about to add a version number to this file, add the command
 that produced it instead. If you must add the number, say which device and which

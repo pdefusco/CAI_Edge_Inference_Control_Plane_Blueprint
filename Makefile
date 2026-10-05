@@ -13,14 +13,25 @@ PIP      := .venv/bin/pip
 PYTEST   := ../.venv/bin/python -m pytest
 
 DEV_DIR    ?= .dev
-API        ?= http://127.0.0.1:$(or $(LIGHTHOUSE_PORT),8000)/api/v1
+# LIGHTHOUSE_URL is the variable scripts/_common.sh reads, so one export drives
+# the shell harness and this Makefile both, rather than two names for the same
+# fact -- which is how `scripts/register_device.sh` and `make fleet` ended up
+# needing separately-spelled configuration to talk to the same deployment.
+# `:/=` strips a trailing slash, for the 404 reason _common.sh explains.
+API        ?= $(if $(LIGHTHOUSE_URL),$(LIGHTHOUSE_URL:/=)/api/v1,http://127.0.0.1:$(or $(LIGHTHOUSE_PORT),8000)/api/v1)
 DEVICE     ?= jetson-sim-01
 MODEL      ?= fashion-cnn
 VERSION    ?= 1
 
 # Read at recipe time, not parse time: the token file does not exist until the
 # first `make dev`, and a Makefile that fails to parse before setup is hostile.
-TOKEN   = $$(cat $(DEV_DIR)/admin-token 2>/dev/null)
+#
+# LIGHTHOUSE_ADMIN_TOKEN wins when set, for the same one-name reason as API, and
+# because against a deployed control plane $(DEV_DIR)/admin-token holds a token
+# minted on this laptop that the deployment has never heard of -- so the fallback
+# is not a fallback but a different credential, and it fails as 401 rather than
+# as "you did not say which token".
+TOKEN   = $(or $(LIGHTHOUSE_ADMIN_TOKEN),$$(cat $(DEV_DIR)/admin-token 2>/dev/null))
 AUTH    = -H "X-Lighthouse-Admin-Token: $(TOKEN)"
 JSON    = -H 'Content-Type: application/json'
 CURL    = curl -sS --fail-with-body

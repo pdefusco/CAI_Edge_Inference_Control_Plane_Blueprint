@@ -17,6 +17,14 @@ ADMIN_TOKEN_FILE="$DEV_DIR/admin-token"
 
 LIGHTHOUSE_PORT="${LIGHTHOUSE_PORT:-8000}"
 BASE_URL="${LIGHTHOUSE_URL:-http://127.0.0.1:$LIGHTHOUSE_PORT}"
+# Trailing slashes stripped, because `API="$BASE_URL/api/v1"` below would
+# otherwise build `https://host//api/v1/devices`, which matches no route and
+# comes back 404. The message then reads "could not enrol <device>" -- a report
+# about the device, when the fault is a character in a URL. A URL copied out of
+# a browser's address bar has that character. Every python entry point here
+# already does this (probe_app.py, probe_registry.py, and the agent's own
+# config.py:76); this was the only one that did not.
+while [[ $BASE_URL == */ ]]; do BASE_URL="${BASE_URL%/}"; done
 API="$BASE_URL/api/v1"
 
 DEVICE_ID="${DEVICE_ID:-jetson-sim-01}"

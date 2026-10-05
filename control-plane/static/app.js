@@ -434,9 +434,15 @@ async function health() {
     const body = await api("/health");
     const reachable = body.registry_reachable !== false;
     $("health-dot").className = `dot ${reachable ? "up" : "down"}`;
-    $("health-text").textContent = reachable
-      ? `${body.device_count} device${body.device_count === 1 ? "" : "s"}`
-      : "registry unreachable";
+    // `device_count` is null for an anonymous caller, which is not the same as
+    // zero devices -- so say nothing about the fleet rather than report "0
+    // devices", which would be a confident lie about someone else's fleet.
+    const count = body.device_count;
+    $("health-text").textContent = !reachable
+      ? "registry unreachable"
+      : count == null
+        ? "ok"
+        : `${count} device${count === 1 ? "" : "s"}`;
     $("fact-registry").textContent = body.registry;
   } catch (_) {
     $("health-dot").className = "dot down";
@@ -585,12 +591,15 @@ function wireEnrollment() {
 
 // -- session ----------------------------------------------------------------
 
+// `#facts` is gated alongside the console: the header carries the fleet size, so
+// leaving it up for a signed-out visitor defeats the gate it sits above.
 function gate() {
   state.signedIn = false;
   setLive(false);
   show($("gate"), true);
   show($("main"), false);
   show($("logout"), false);
+  show($("facts"), false);
 }
 
 async function enter() {
@@ -598,6 +607,11 @@ async function enter() {
   show($("gate"), false);
   show($("main"), true);
   show($("logout"), true);
+  show($("facts"), true);
+  // Re-read health immediately rather than waiting out the 15s interval: the
+  // reading taken while signed out withheld `device_count`, so the bar would
+  // otherwise show "ok" to a signed-in operator for up to fifteen seconds.
+  health();
   await loadModels();
   await refresh();
   setLive($("auto").checked);
@@ -654,11 +668,26 @@ async function main() {
   // Probe with a real authenticated request rather than looking for a cookie:
   // the session cookie is HttpOnly and therefore invisible here, which is the
   // point of it.
+  //
+  // Every path out of here must end at the gate or at the console, never at
+  // neither. Both start hidden, so a `catch` that only logged left the page
+  // permanently blank below the header whenever this request failed for any
+  // reason other than 401 -- a 502 from the CAI ingress, a 503 while the
+  // registry was unreachable, or a dropped connection. The operator saw a dead
+  // page with no sign-in form and nothing to read.
   try {
     state.devices = await api("/devices");
     await enter();
   } catch (error) {
-    if (!(error instanceof Unauthorized)) console.error(error);
+    // `api()` has already called `gate()` on a 401; calling it again is both
+    // harmless and what makes the non-401 path land somewhere.
+    gate();
+    if (!(error instanceof Unauthorized)) {
+      const banner = $("login-error");
+      banner.textContent = `Could not reach the control plane: ${error.message}`;
+      show(banner, true);
+      console.error(error);
+    }
   }
 }
 

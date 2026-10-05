@@ -176,6 +176,14 @@ pre,
   font-weight: 500;
 }
 
+/* The gated half of the header bar. `display: contents` so the wrapper that
+   exists only to carry one `hidden` attribute does not become a flex item and
+   collapse the gaps between the facts it holds. The `[hidden]` reset still wins
+   over this, which is the whole point of its `!important`. */
+.facts-gated {
+  display: contents;
+}
+
 .dot {
   display: inline-block;
   width: 7px;

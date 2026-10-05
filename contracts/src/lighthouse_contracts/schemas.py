@@ -242,7 +242,9 @@ class HealthResponse(Strict):
     version: str
     registry: str = Field(description="Which ModelRegistry implementation is wired in")
     registry_reachable: bool | None = None
-    device_count: int = 0
+    # Null for an anonymous caller: this is fleet data, and `/health` is open on a
+    # public URL. Null means "not told", which 0 would misreport as an empty fleet.
+    device_count: int | None = None
     server_time: datetime
 
 

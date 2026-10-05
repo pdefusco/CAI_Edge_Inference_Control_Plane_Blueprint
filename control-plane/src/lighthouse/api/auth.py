@@ -121,6 +121,28 @@ def require_operator(
     return OperatorPrincipal()
 
 
+def is_operator(request: Request, context: AppContext = Depends(ctx)) -> bool:
+    """Whether the caller holds an operator credential, without refusing if not.
+
+    For a route that must stay open to anyone but should say *more* to an
+    operator -- `/health`, which a CAI Application needs unauthenticated for
+    probing, yet which used to hand `device_count` to every anonymous caller on
+    a public URL.
+
+    Deliberately implemented by calling `require_operator` and catching, rather
+    than by re-checking the cookie and the header here. Two copies of this logic
+    is how one of them ends up accepting a device token: the rules about
+    `DEVICE_TOKEN_PREFIX`, `SESSION_PREFIX` and `compare_digest` above are
+    security-relevant and must have exactly one home. The cost is an exception on
+    the anonymous path, which is not a hot path.
+    """
+    try:
+        require_operator(request, context)
+    except HTTPException:
+        return False
+    return True
+
+
 def require_device(
     request: Request,
     device_id: str = Path(...),

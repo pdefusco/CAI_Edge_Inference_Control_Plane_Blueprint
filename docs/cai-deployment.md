@@ -548,6 +548,13 @@ Application, curled from a Session, returned
  "device_count":0,"server_time":"2026-10-05T01:19:58.685335Z"}
 ```
 
+That transcript is kept verbatim, but one field in it has since changed: the
+curl carried no credential, and `device_count` is now **`null`** for an
+unauthenticated caller rather than a real number. It used to be unconditional,
+which handed the fleet size to anyone who could reach this route — and with
+platform authentication disabled, that is anyone at all. See §6. `0` above is
+therefore what the route used to say to a stranger, not what it says now.
+
 `registry_reachable: true` beside `registry: cai` is the whole answer: per the
 reasoning at the end of this section, that field is a real authenticated fetch of
 `/models`, so the `cdp iam generate-workload-auth-token` chain **does** work
@@ -691,6 +698,23 @@ discovering it afterwards: create this Application with authentication
 **disabled**, and §3's "write down which way you set that toggle" then has a
 deliberate answer rather than a default.
 
+**What disabling the toggle costs, and what was done about it.** Everything the
+app serves without a credential of its own is then served to the public
+internet, and the only two such routes are `/api/v1/health` and `/api/v1/session`
+(every other route takes `require_operator` or `require_device`). Health has to
+stay open — `probe_app.py` reaches it before any token exists, and row 3 of the
+table above is only distinguishable because it does. But it used to return
+`device_count` unconditionally: measured 2026-10-04 against a local run with two
+devices enrolled, an unauthenticated `curl` returned `"device_count":2`. It now
+returns `null` to anyone who is not an operator (`api/auth.py:is_operator`), and
+the dashboard header that displayed it is gated with the console body. `null`
+rather than `0`, because a stranger cannot tell a withheld count from an empty
+fleet and `0` would claim to be the latter.
+
+That leaves `LIGHTHOUSE_ADMIN_TOKEN` as the only gate on the operator surface of
+a public URL — which is §2's point about generating it with
+`openssl rand -hex 32` rather than choosing one.
+
 `probe_app.py` also settles the question recorded at `api/auth.py:22-27` — whether
 CML's ingress forwards custom request headers to an Application — by sending the
 operator credential both as `X-Lighthouse-Admin-Token` and as
@@ -709,15 +733,18 @@ curl -sS https://<app-url>/api/v1/health
 `-sS`, not bare `-s`, for the reason §3 gives: `-s` hides curl's own errors, so
 a reset connection and an empty-bodied 502 both read as success with no output.
 
-Expect JSON naming the version, the selected registry and the env — `registry`
-should read `cai`, not `fake`. Read `registry_reachable` in the same response:
-per §5 it is a real authenticated call to the registry, so `true` is your first
-evidence that the Application's `cdp` chain works. It is also the only route that
-needs no credential, which makes it the right thing to curl first. Then, with the
-admin token:
+Expect JSON naming the version and the selected registry — `registry` should read
+`cai`, not `fake`. (Not the env: `HealthResponse` has no such field, and an
+earlier version of this line said it did. The dashboard shows `env` because the
+template is rendered server-side, not because health reports it.) Read
+`registry_reachable` in the same response: per §5 it is a real authenticated call
+to the registry, so `true` is your first evidence that the Application's `cdp`
+chain works. It is also the only route that needs no credential, which makes it
+the right thing to curl first — and the reason `device_count` comes back `null`
+here rather than a number (§6). Then, with the admin token:
 
 ```
-curl -s https://<app-url>/api/v1/models \
+curl -sS https://<app-url>/api/v1/models \
   -H 'Authorization: Bearer <LIGHTHOUSE_ADMIN_TOKEN>'
 ```
 

@@ -8,27 +8,39 @@ from pydantic import BaseModel, ConfigDict
 
 from .. import __version__
 from ..util import now_utc
-from .auth import SESSION_COOKIE, require_operator
+from .auth import SESSION_COOKIE, is_operator, require_operator
 from .deps import AppContext, ctx
 
 router = APIRouter(tags=["meta"])
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(context: AppContext = Depends(ctx)) -> HealthResponse:
-    """Unauthenticated liveness.
+def health(
+    context: AppContext = Depends(ctx),
+    operator: bool = Depends(is_operator),
+) -> HealthResponse:
+    """Liveness, open to anyone, but `device_count` only for an operator.
 
-    Deliberately the only open route: a CAI Application needs something to probe,
-    and the fields here are operational facts, not fleet data. `registry_reachable`
-    is a real call, because "the process is up but cannot see the registry" is the
-    failure an operator actually needs to distinguish.
+    Deliberately the only open route besides `/session`: a CAI Application needs
+    something to probe. `registry_reachable` is a real call, because "the process
+    is up but cannot see the registry" is the failure an operator actually needs
+    to distinguish.
+
+    **`device_count` is fleet data and is withheld from anonymous callers.** It
+    used to be unconditional, under a comment claiming the fields here were
+    "operational facts, not fleet data" -- which was not true of a device count.
+    An Application created with platform authentication disabled (as one serving
+    machine clients must be, see `docs/cai-deployment.md` §6) puts this route on
+    the public internet, where the size of someone's fleet was one unauthenticated
+    `curl` away. `None` rather than `0` for the anonymous case on purpose: zero is
+    a real count and would be a lie.
     """
     return HealthResponse(
         status="ok",
         version=__version__,
         registry=context.registry.name,
         registry_reachable=context.catalog.ping(),
-        device_count=context.store.device_count(),
+        device_count=context.store.device_count() if operator else None,
         server_time=now_utc(),
     )
 

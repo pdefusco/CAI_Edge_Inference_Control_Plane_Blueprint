@@ -26,13 +26,23 @@
     <span class="tag">edge model governance</span>
   </div>
   <div class="facts">
-    <span class="fact" title="Which ModelRegistry implementation is wired in">
-      registry <b id="fact-registry">{{ registry }}</b>
-    </span>
-    <span class="fact">env <b>{{ env }}</b></span>
-    <span class="fact">v{{ version }}</span>
-    <span class="fact" id="health" title="GET /api/v1/health">
-      <span class="dot" id="health-dot"></span><b id="health-text">checking…</b>
+    {#
+      Gated with the console body, not left on show. A signed-out visitor has no
+      business reading the fleet size, and this bar is where it used to appear:
+      `/api/v1/health` is open by necessity, so the only thing stopping an
+      anonymous reader was that nobody looked at the header. The route now
+      withholds `device_count` too -- this is the second half of that fix, and
+      the half that also hides registry, env and version.
+    #}
+    <span class="facts-gated" id="facts" hidden>
+      <span class="fact" title="Which ModelRegistry implementation is wired in">
+        registry <b id="fact-registry">{{ registry }}</b>
+      </span>
+      <span class="fact">env <b>{{ env }}</b></span>
+      <span class="fact">v{{ version }}</span>
+      <span class="fact" id="health" title="GET /api/v1/health">
+        <span class="dot" id="health-dot"></span><b id="health-text">checking…</b>
+      </span>
     </span>
     <button type="button" id="logout" class="ghost" hidden>Sign out</button>
   </div>

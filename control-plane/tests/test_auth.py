@@ -361,6 +361,77 @@ def test_deleting_a_device_invalidates_its_token(app, admin, device):
 
 
 # --------------------------------------------------------------------------
+# What the one open route says to whom
+# --------------------------------------------------------------------------
+#
+# `/health` cannot require a credential -- a CAI Application needs something to
+# probe, and `scripts/probe_app.py` reaches it before any token exists. So it is
+# the one route where the question is not "does this refuse?" but "how much does
+# it say to a stranger?". It used to say the fleet size, under a comment claiming
+# its fields were "operational facts, not fleet data". Measured 2026-10-04 against
+# a local run with two devices enrolled: an unauthenticated `curl` returned
+# `"device_count":2`. With platform authentication disabled -- which an
+# Application serving machine clients must have, see `docs/cai-deployment.md` §6
+# -- that is on the public internet.
+#
+# `api/auth.py:is_operator` is what decides, and it exists only for this route.
+# These tests pin both halves: that it tells an operator the truth, and that
+# nothing short of an operator credential counts -- in particular not a device
+# token, which is the mistake a second copy of the auth rules would make.
+
+
+def test_health_is_open_to_anyone(client):
+    assert client.get("/api/v1/health").status_code == 200
+
+
+def test_an_anonymous_health_check_is_told_nothing_about_the_fleet(client, device):
+    """`None`, not `0`.
+
+    The `device` fixture means there is genuinely one device, so a `0` here would
+    be a confident lie rather than a withholding -- and an anonymous caller cannot
+    tell the two apart. `None` is the only honest answer to a question you are
+    declining to answer.
+    """
+    body = client.get("/api/v1/health").json()
+
+    assert body["status"] == "ok"
+    assert body["device_count"] is None
+
+
+def test_an_operator_health_check_reports_the_fleet_size(admin, device):
+    assert admin.get("/api/v1/health").json()["device_count"] == 1
+
+
+def test_the_session_cookie_unlocks_the_fleet_size(dashboard, device):
+    """The dashboard's own credential has to work here, or the header bar it feeds
+    would read "ok" to a signed-in operator forever."""
+    sign_in(dashboard)
+
+    assert dashboard.get("/api/v1/health").json()["device_count"] == 1
+
+
+def test_a_device_token_does_not_unlock_the_fleet_size(agent, device):
+    """The two schemes stay disjoint on the open route too.
+
+    This is the whole reason `is_operator` delegates to `require_operator` instead
+    of re-reading the header itself: a second copy of the prefix checks is how one
+    of them ends up treating `lhd_…` as good enough.
+    """
+    assert agent.get("/api/v1/health").json()["device_count"] is None
+
+
+def test_a_session_secret_as_a_bearer_does_not_unlock_the_fleet_size(dashboard, device):
+    cookie = sign_in(dashboard)
+    dashboard.cookies.clear()
+
+    body = dashboard.get(
+        "/api/v1/health", headers={"Authorization": f"Bearer {cookie}"}
+    ).json()
+
+    assert body["device_count"] is None
+
+
+# --------------------------------------------------------------------------
 # Fail closed
 # --------------------------------------------------------------------------
 
@@ -385,3 +456,27 @@ def test_an_unconfigured_admin_token_closes_the_operator_surface(tmp_path, store
         response = http.get("/api/v1/devices")
 
     assert response.status_code == 503
+
+
+def test_an_unconfigured_admin_token_withholds_the_fleet_size(tmp_path, store):
+    """`is_operator` must read a 503 as "not an operator", not as "no auth needed".
+
+    It catches `HTTPException` rather than a 401 specifically, which is what makes
+    this hold: the unconfigured case raises 503, and a handler that only caught 401
+    would let it through -- turning the worst misconfiguration into the one that
+    also talks. `/health` still answers, because an unreachable liveness probe is
+    how this failure would become invisible.
+    """
+    from starlette.testclient import TestClient
+
+    from lighthouse.config import Settings
+    from lighthouse.main import create_app
+
+    open_settings = Settings(
+        env="local", data_dir=tmp_path / "x", registry_impl="fake", admin_token=None
+    )
+    with TestClient(create_app(open_settings, store=store)) as http:
+        response = http.get("/api/v1/health")
+
+    assert response.status_code == 200
+    assert response.json()["device_count"] is None

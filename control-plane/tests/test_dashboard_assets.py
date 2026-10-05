@@ -18,9 +18,15 @@ stayed empty because the fetches 401'd -- but the page asserted the opposite of
 the truth in both directions at once, which is worse than a blank screen for the
 one reader it has.
 
-These two tests are deliberately a pair. The first asserts the reset exists; the
-second asserts the hazard it defends against is still live, so the first cannot
-degrade into a test that guards nothing.
+The first two tests are deliberately a pair. The first asserts the reset exists;
+the second asserts the hazard it defends against is still live, so the first
+cannot degrade into a test that guards nothing.
+
+The rest are about the session gate specifically, which is what the CSS bug made
+visible: a landing page must show the sign-in panel and nothing else, and that
+depends on two things no type checker sees -- that every element the gate
+controls starts `hidden` in the template, and that signing out puts back exactly
+what signing in revealed.
 """
 
 from __future__ import annotations
@@ -31,11 +37,13 @@ from pathlib import Path
 _ASSETS = Path(__file__).resolve().parent.parent
 _CSS = (_ASSETS / "static" / "app.css").read_text()
 _HTML = (_ASSETS / "templates" / "index.html").read_text()
+_JS = (_ASSETS / "static" / "app.js").read_text()
 
 _COMMENTS = re.compile(r"/\*.*?\*/", re.DOTALL)
 _RULE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.DOTALL)
 _DISPLAY = re.compile(r"(?:^|;)\s*display\s*:([^;]*)", re.IGNORECASE)
 _HIDDEN_TAG = re.compile(r"<(\w+)((?:[^>\"']|\"[^\"]*\"|'[^']*')*?)\bhidden\b", re.DOTALL)
+_SHOW = re.compile(r"""show\(\$\(["'](\w[\w-]*)["']\)""")
 
 
 def _rules() -> list[tuple[list[str], str]]:
@@ -61,6 +69,19 @@ def _hidden_elements() -> list[set[str]]:
             selectors.update(f".{c}" for c in match.group(1).split())
         found.append(selectors)
     return found
+
+
+def _gate_toggles(name: str) -> set[str]:
+    """The element ids `gate()` or `enter()` passes to `show()`.
+
+    Reading the source rather than running it: there is no DOM here and no build
+    step, and a headless browser for two functions would be a heavier dependency
+    than the whole dashboard. The bodies are matched up to a closing brace in
+    column 1, which holds because nothing inside them is unindented.
+    """
+    body = re.search(rf"\n(?:async )?function {name}\(\) \{{\n(.*?)\n\}}", _JS, re.DOTALL)
+    assert body, f"could not find `{name}()` in static/app.js"
+    return set(_SHOW.findall(body.group(1)))
 
 
 def test_the_hidden_attribute_is_reset_with_important():
@@ -105,4 +126,38 @@ def test_the_reset_is_load_bearing_not_decorative():
     assert overrides, (
         "expected at least one author `display` rule aimed at an element that "
         "app.js gates with `hidden`; that collision is why the reset exists"
+    )
+
+
+def test_signing_out_puts_back_everything_signing_in_revealed():
+    """`gate()` and `enter()` must name the same elements.
+
+    An id revealed by `enter()` but not re-hidden by `gate()` survives a sign-out
+    -- which is how the header's fleet facts came to sit above a sign-in form in
+    the first place. Asserting set equality rather than a hardcoded list so the
+    next element added to the gate is covered without anyone remembering to.
+    """
+    assert _gate_toggles("gate") == _gate_toggles("enter")
+
+
+def test_nothing_the_gate_controls_is_visible_before_it_runs():
+    """The landing page is the sign-in panel and nothing else.
+
+    `gate()` runs only after `main()`'s boot probe answers, so the server's HTML
+    is what a visitor sees for one network round trip -- longer, if the control
+    plane is slow or unreachable. Any gated element without `hidden` in the
+    template is on screen for that whole window regardless of what app.js later
+    decides, and `#facts` carried the fleet size.
+    """
+    gated_in_html = {
+        selector.removeprefix("#")
+        for element in _hidden_elements()
+        for selector in element
+        if selector.startswith("#")
+    }
+
+    missing = _gate_toggles("enter") - gated_in_html
+    assert not missing, (
+        f"{sorted(missing)} are toggled by the session gate but do not carry "
+        "`hidden` in templates/index.html, so they render before sign-in"
     )

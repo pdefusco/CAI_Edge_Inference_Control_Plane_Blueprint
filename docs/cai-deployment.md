@@ -656,6 +656,39 @@ Two things it does not cover, both still owed to `probe_app.py`: the off-VPN run
 itself, and whether a credential survives the ingress on either header, since
 health needs none.
 
+**Measured 2026-10-05: `probe_app.py` reports row 1 — but from inside the VPN,
+which is not the run that decides.** The full probe against the deployed
+Application returned `REACHABLE, and bearer auth is intact`. Taken from a laptop
+whose default route was a VPN tunnel, so read it as a *second baseline* and not
+as the device answer. What it newly settles, none of which the health curl could:
+
+* **All four device routes answer, and answer as our own app.** Desired-state,
+  heartbeat and artifact each returned a 401 carrying lighthouse's `code` /
+  `message` / `detail` envelope — not a 302, not HTML. The ingress is forwarding
+  the device surface, not just `/health`.
+* **`Authorization: Bearer` survives the ingress.** This is the half of
+  `api/auth.py:22-27` the probe can answer without an operator token, and it
+  turns on the one distinction the script was built around: an *invalid* device
+  token was refused with `invalid device token`, while the control request with
+  no header at all was refused with `device token required`. Two different
+  messages means the bearer actually arrived and was judged on its merits — a
+  stripped header would have produced the no-credential message for both, with
+  everything still looking healthy. A real device token would therefore be
+  accepted.
+* **The auth toggle is genuinely off.** `GET /` returned HTML with a 200 rather
+  than redirecting to the workbench login, which is the §3 toggle confirmed from
+  the outside rather than from the creation form.
+* **The `device_count` withholding is live.** The unauthenticated health body
+  read `"device_count": null`, so the deployed Application is serving
+  post-fix code and the disclosure described later in this section is closed in
+  the deployment, not only in the repo.
+
+Still owed, and neither is a formality: **the off-VPN run**, which is the only
+one that speaks for a Jetson on a home network, and whether
+**`X-Lighthouse-Admin-Token`** — a *custom* header, the one CML's ingress might
+plausibly drop where it forwards `Authorization` — survives. The second needs
+`--admin-token-env`, which the run above did not pass.
+
 **Row 2 is where an authentication-enabled Application lands, and you do not
 need the VPN off to see it.** Observed 2026-10-04, curling
 `/api/v1/health` from a terminal in a CAI **Session** — the baseline run, inside

@@ -119,7 +119,26 @@ require_ok() {
   local status="$1" what="$2"
   case "$status" in
     2*) return 0 ;;
-    401 | 403) die "operator credential rejected (HTTP $status). Stale $ADMIN_TOKEN_FILE? Delete it, then restart the control plane so it loads the new one." ;;
+    # Two different faults wear this status, and the fix for one is useless for
+    # the other, so the message has to know which token it actually sent.
+    # Naming the local file while the environment supplied the credential sends
+    # the operator off to delete a file that was never read.
+    401 | 403)
+      if [[ -n "${LIGHTHOUSE_ADMIN_TOKEN:-}" ]]; then
+        die "operator credential rejected (HTTP $status) by $BASE_URL.
+
+    The token came from LIGHTHOUSE_ADMIN_TOKEN in this shell. $ADMIN_TOKEN_FILE
+    was never read, so deleting it changes nothing. The value has to equal the
+    LIGHTHOUSE_ADMIN_TOKEN in that control plane's own environment -- for a CAI
+    Application, the one set in its environment variables, which is where the
+    deployment got the token it is checking against. Compare the two without
+    printing either:
+
+      printf '%s' \"\$LIGHTHOUSE_ADMIN_TOKEN\" | shasum -a 256 | cut -c1-8"
+      else
+        die "operator credential rejected (HTTP $status) by $BASE_URL. Stale $ADMIN_TOKEN_FILE? Delete it, then restart the control plane so it loads the new one."
+      fi
+      ;;
     *) die "HTTP $status from the control plane: $what" ;;
   esac
 }

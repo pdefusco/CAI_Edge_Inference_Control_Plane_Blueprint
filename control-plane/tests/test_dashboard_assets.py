@@ -22,17 +22,29 @@ The first two tests are deliberately a pair. The first asserts the reset exists;
 the second asserts the hazard it defends against is still live, so the first
 cannot degrade into a test that guards nothing.
 
-The rest are about the session gate specifically, which is what the CSS bug made
-visible: a landing page must show the sign-in panel and nothing else, and that
-depends on two things no type checker sees -- that every element the gate
+The next group is about the session gate specifically, which is what the CSS bug
+made visible: a landing page must show the sign-in panel and nothing else, and
+that depends on two things no type checker sees -- that every element the gate
 controls starts `hidden` in the template, and that signing out puts back exactly
 what signing in revealed.
+
+The last group exists because everything above it was green while the deployed
+dashboard was still broken, and the reason is worth stating plainly: **every
+test above reads a file off disk, so none of them assert anything about what a
+browser receives.** On 2026-10-04 the repo was correct, the container served the
+correct bytes, and the operator's browser still ran the pre-`a340e82` CSS and JS
+against post-`7841774` HTML -- the sign-in panel and the console on screen
+together, because `StaticFiles` sends no `Cache-Control` and the asset URLs
+carried no cache key. Reading the files could not have caught that. Rendering
+the page can, so those tests go through the app.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from lighthouse import main
 
 _ASSETS = Path(__file__).resolve().parent.parent
 _CSS = (_ASSETS / "static" / "app.css").read_text()
@@ -161,3 +173,93 @@ def test_nothing_the_gate_controls_is_visible_before_it_runs():
         f"{sorted(missing)} are toggled by the session gate but do not carry "
         "`hidden` in templates/index.html, so they render before sign-in"
     )
+
+
+# -- what the browser actually receives -------------------------------------
+#
+# See the last paragraph of the module docstring. These render the page.
+
+_ASSET_REF = re.compile(r"""(?:href|src)=["'](/static/[^"']+)["']""")
+
+
+def test_every_asset_the_page_requests_carries_a_content_digest(client):
+    """No bare `/static/...` may reach a browser.
+
+    A URL without a cache key is one a browser is entitled to satisfy from disk
+    without asking, and `StaticFiles` sends no `Cache-Control` to argue
+    otherwise. That is how a cached stylesheet with no `[hidden]` reset outlived
+    two deploys that fixed it.
+    """
+    refs = _ASSET_REF.findall(client.get("/").text)
+    assert refs, "no /static/ references in the rendered page -- did the template change?"
+
+    unstamped = [ref for ref in refs if not re.search(r"\?v=[0-9a-f]{12}$", ref)]
+    assert not unstamped, (
+        f"{unstamped} are served without a content digest. Reference assets as "
+        "`{{ assets['app.css'] }}`, not as a literal path -- see "
+        "`lighthouse.main.asset_urls`."
+    )
+
+
+def test_the_digest_stamped_url_is_one_the_app_will_serve(client):
+    """A cache key that 404s is worse than none: the page loses its CSS entirely.
+
+    `StaticFiles` ignores the query string, so this should hold -- which is the
+    point of asserting it rather than assuming it.
+    """
+    for ref in _ASSET_REF.findall(client.get("/").text):
+        response = client.get(ref)
+        assert response.status_code == 200, f"{ref} -> {response.status_code}"
+        assert response.content, f"{ref} served empty"
+
+
+def test_the_page_requests_the_digest_of_the_bytes_it_will_get(client):
+    """The stamp must be of the served content, not of anything else.
+
+    Guards the failure that would make the whole mechanism theatre: a digest
+    that never matches what `/static` returns changes on nothing, or changes on
+    everything, and either way stops being a signal.
+    """
+    import hashlib
+
+    for ref in _ASSET_REF.findall(client.get("/").text):
+        path, _, query = ref.partition("?")
+        served = client.get(path).content
+        assert query == f"v={hashlib.sha256(served).hexdigest()[:12]}", (
+            f"the stamp on {ref} is not the digest of what {path} serves"
+        )
+
+
+def test_the_url_changes_when_the_asset_changes(tmp_path, monkeypatch):
+    """The one property that fixes the bug. Everything else is bookkeeping."""
+    monkeypatch.setattr(main, "_STATIC_DIR", tmp_path)
+    asset = tmp_path / "app.css"
+
+    asset.write_text("main { display: grid }")
+    before = main.asset_urls()["app.css"]
+
+    asset.write_text("[hidden] { display: none !important }")
+    assert main.asset_urls()["app.css"] != before
+
+
+def test_the_url_is_keyed_by_content_and_not_by_mtime(tmp_path, monkeypatch):
+    """A fresh checkout or a rebuilt container rewrites mtimes, changing nothing.
+
+    Busting the cache then is not harmlessly conservative: a digest that moves
+    when the bytes did not is noise, and a number that is usually noise is one
+    nobody reads when it finally means something.
+    """
+    monkeypatch.setattr(main, "_STATIC_DIR", tmp_path)
+    asset = tmp_path / "app.js"
+    asset.write_text("function gate() {}")
+
+    before = main.asset_urls()["app.js"]
+    asset.touch()
+    assert main.asset_urls()["app.js"] == before
+
+
+def test_a_missing_asset_does_not_break_the_page(tmp_path, monkeypatch):
+    """`_mount_dashboard` treats an absent dashboard as legitimate, so stamping
+    must degrade to the bare path rather than raise on a half-present one."""
+    monkeypatch.setattr(main, "_STATIC_DIR", tmp_path)
+    assert main.asset_urls()["app.css"] == "/static/app.css"

@@ -13,7 +13,11 @@
   because unpkg.com is unreachable is not a demo.
 #}
 <title>Lighthouse</title>
-<link rel="stylesheet" href="/static/app.css" />
+{# Digest-stamped by `main.asset_urls()`. Never write these paths bare: this HTML
+   is re-rendered every request and the static files are not, so an unstamped URL
+   lets a browser keep a pre-fix app.css that cancels the auth gate's `hidden`
+   attributes. That happened on 2026-10-04; `asset_urls()` records the symptom. #}
+<link rel="stylesheet" href="{{ assets['app.css'] }}" />
 <link
   rel="icon"
   href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🗼</text></svg>"
@@ -194,4 +198,4 @@
 <script>
   window.LIGHTHOUSE = { heartbeatInterval: {{ poll_interval }} };
 </script>
-<script src="/static/app.js"></script>
+<script src="{{ assets['app.js'] }}"></script>

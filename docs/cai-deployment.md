@@ -536,6 +536,51 @@ never touches a version a live desired deployment still references. On the proje
 filesystem that default can quietly eat a quota — set it to something matching
 what the project actually has.
 
+### The third kind of state: the browser's copy of the dashboard
+
+**Observed 2026-10-04, and it cost two deploys that each looked like a failed
+fix.** The operator's browser was running `/static/app.css` and `/static/app.js`
+from *before* the auth-gating fix, against `index.html` from after it. The
+result was both halves of the sign-in gate on screen at once — the operator
+sign-in panel above a fully rendered console — for a signed-in session, on a
+redeploy that had demonstrably shipped the correct bytes. `curl` against the
+live app returned the fixed files the whole time.
+
+The asymmetry is the cause, and it is structural rather than a one-off:
+
+* `index.html` is rendered by Jinja on **every request**, so template changes
+  are live the instant the Application restarts;
+* `app.css` and `app.js` are served by `StaticFiles`, which sends `etag` and
+  `last-modified` but **no `Cache-Control`** — and with no `Cache-Control` a
+  browser applies *heuristic* freshness and may reuse what it already holds
+  **without revalidating**. A reload does not necessarily fetch them.
+
+So the fix is deployed and invisible, and nothing in the server logs says so.
+Worse than a styling bug: the gate stops gating, and only for the returning
+visitors who are the dashboard's actual audience.
+
+**This is now fixed in the repo and needs no action from you.** The template
+references assets as `{{ assets['app.css'] }}`, and `main.asset_urls()` stamps
+each one with a 12-hex digest of its own bytes — `/static/app.css?v=cfe90172bc06`.
+A deploy that changes a byte changes the URL, so the stale entry becomes
+unreachable rather than merely out of date, which also defeats intermediate
+caches that ignore a header. Digest over content and not mtime, because a
+container rebuild rewrites every mtime without changing anything, and a cache
+key that moves for no reason is one nobody trusts when it finally means
+something.
+
+Two things to carry forward:
+
+* **If you ever see the dashboard contradict itself** — a sign-in form over live
+  data, a console for a signed-out visitor — hard-reload (`Cmd/Ctrl+Shift+R`)
+  **before** debugging the server. It is a five-second test that separates "the
+  deploy did not take" from "your browser did not ask".
+* **Never write a bare `/static/...` path into the template.**
+  `control-plane/tests/test_dashboard_assets.py` renders the page and fails on
+  one, which is deliberate: every other test in that file reads the asset files
+  off disk, and that is exactly why a correct repo and a correct container still
+  produced a broken page.
+
 ---
 
 ## 5. Does the Application have the registry's credential?

@@ -7,6 +7,7 @@ the app unreachable with no error anywhere.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -261,8 +262,64 @@ def _mount_dashboard(app: FastAPI, context: AppContext) -> None:
                 "registry": context.registry.name,
                 "env": context.settings.env,
                 "poll_interval": context.settings.heartbeat_interval_seconds,
+                "assets": asset_urls(),
             },
         )
+
+
+# The dashboard's two static files. Named rather than globbed: the template
+# references exactly these, and a digest computed for a file nothing asks for is
+# work that silently does nothing.
+DASHBOARD_ASSETS = ("app.css", "app.js")
+
+
+def asset_urls() -> dict[str, str]:
+    """`/static/<name>?v=<digest>` per dashboard asset, keyed by content.
+
+    Cache-busting, and it is here because of a real bug rather than for tidiness.
+    `index.html` is rendered by Jinja on every request; `app.css` and `app.js`
+    are not, and `StaticFiles` answers with `etag` and `last-modified` but **no
+    `Cache-Control`** -- so a browser falls back to heuristic freshness and may
+    reuse a stylesheet it already holds *without revalidating it at all*.
+
+    Observed 2026-10-04 against a deployed Application. The operator was served
+    HTML carrying the post-fix `hidden` attributes while their browser still ran
+    `app.css` and `app.js` from before `a340e82`: the old CSS had no `[hidden]`
+    reset, so `.gate { display: grid }` kept the sign-in panel on screen, and the
+    old `enter()` revealed the console beside it. Both halves of the auth gate
+    were visible at once for a signed-in operator, and a reload did not fix it.
+
+    **An auth gate that quietly stops gating for returning visitors is a security
+    bug, not a styling one.** Hence a URL that changes whenever the bytes change:
+    the next deploy's HTML asks for a URL no cache has an entry for, which makes
+    a stale copy unreachable rather than merely out of date. That is stronger
+    than any `Cache-Control` header, because it also defeats intermediate caches
+    that ignore one.
+
+    Two deliberate choices:
+
+    * **Digest over content, not mtime.** A fresh checkout or a container rebuild
+      rewrites every mtime without changing a byte, which would bust the cache
+      for no reason and -- worse -- train whoever sees it to distrust the number.
+    * **Computed per request, not once at mount.** Two small reads and a sha256
+      per *page* load (the data arrives over the API, not by re-rendering this
+      template), against the alternative of a dev editing `app.css`, reloading,
+      and seeing nothing change because the digest was frozen at startup. That
+      is precisely the failure this function exists to remove, and it would have
+      been reintroduced in the one environment where it gets noticed late.
+
+    A missing file falls back to the bare path: `_mount_dashboard` already treats
+    an absent dashboard as legitimate, so this must not be the thing that raises.
+    """
+    urls = {}
+    for name in DASHBOARD_ASSETS:
+        path = _STATIC_DIR / name
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+            urls[name] = f"/static/{name}?v={digest}"
+        else:
+            urls[name] = f"/static/{name}"
+    return urls
 
 
 def run() -> None:

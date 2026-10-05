@@ -129,6 +129,16 @@
         <h3>Actual <span class="muted" id="actual-gen"></span></h3>
         <dl id="actual-dl"></dl>
       </div>
+      <div class="card">
+        {# The device's own self-description, from the last heartbeat. It sits
+           beside Actual rather than inside it because governance compares
+           desired to actual and this card answers a different question: whether
+           the device is using the accelerator it was bought for. A Jetson
+           serving on its CPU is a failed acceptance check and correctly
+           HEALTHY governance -- see `Acceleration` in the contracts. #}
+        <h3>Hardware <span class="muted" id="hardware-sub"></span></h3>
+        <dl id="hardware-dl"></dl>
+      </div>
       <div class="card controls">
         <h3>Control</h3>
         <label for="model">Model</label>

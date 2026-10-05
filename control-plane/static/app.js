@@ -132,6 +132,13 @@ const ACTUAL = {
 
 const DESIRED = { RUNNING: "info", STOPPED: "idle", REVOKED: "bad" };
 
+// `CPU_ONLY` is deliberately `bad` and not `pending` or `info`. A device bought
+// for its GPU and serving on its CPU is a failed Phase 6 acceptance check, and
+// it will sit next to a green HEALTHY badge -- correctly, because governance
+// asks whether desired and actual agree and they do. If this badge is not the
+// loud one on the row, nothing on the page says the check failed.
+const ACCELERATION = { ACCELERATED: "ok", CPU_ONLY: "bad", UNKNOWN: "idle" };
+
 function badge(value, palette) {
   const text = value || "—";
   return el("span", { class: `badge ${palette[text] || "idle"}`, text });
@@ -225,8 +232,63 @@ function renderFleet() {
 function pairs(dl, entries) {
   clear(dl);
   for (const [term, value] of entries) {
-    dl.append(el("dt", { text: term }), el("dd", { text: value ?? "—" }));
+    // A Node value is appended as the <dd>'s child so a row can carry a badge;
+    // anything else goes in as text, which keeps rule 2 of the module docstring
+    // (nothing from the API reaches innerHTML) true for every existing caller.
+    const dd = value instanceof Node ? el("dd", {}, value) : el("dd", { text: value ?? "—" });
+    dl.append(el("dt", { text: term }), dd);
   }
+}
+
+// `smoke_check` arrives as a sentence rather than an enum: "passed", "not run",
+// "disabled", "skipped: <why>", "failed: <why>" -- see `hardware_info()` in
+// `keeper/runtime/onnx.py`. The leading word colours the badge; the reason after
+// the colon is kept verbatim beside it, because the reason is the only part that
+// says what to do next. A badge that swallowed "skipped: the graph declares 2
+// inputs" would turn a diagnosis into a shrug.
+const SMOKE = { passed: "ok", failed: "bad", skipped: "pending", disabled: "info" };
+
+function smokeCell(value) {
+  if (!value) return null;
+  const [head, ...rest] = String(value).split(":");
+  const verdict = head.trim();
+  const reason = rest.join(":").trim();
+  const node = el("span", { class: `badge ${SMOKE[verdict] || "idle"}`, text: verdict });
+  if (!reason) return node;
+  return el("span", {}, node, el("span", { class: "muted", text: ` ${reason}` }));
+}
+
+function providerList(value) {
+  return Array.isArray(value) && value.length ? value.join(", ") : null;
+}
+
+function renderHardware(device) {
+  const hw = device.hardware || {};
+  // The device's own name for itself when it has one -- `/proc/device-tree/model`
+  // on a Jetson -- falling back to the platform triple.
+  $("hardware-sub").textContent = hw.device_model || hw.platform || "";
+
+  const accel = ["Acceleration", badge(device.acceleration, ACCELERATION)];
+  if (!Object.keys(hw).length) {
+    pairs($("hardware-dl"), [
+      accel,
+      ["Reported", "nothing yet — no heartbeat has carried hardware"],
+    ]);
+    return;
+  }
+
+  pairs($("hardware-dl"), [
+    accel,
+    // Both provider lists, never one. The gap between them is the trap this card
+    // exists for: a build can report CUDA as available while the loaded session
+    // runs every node on the CPU, because a provider that cannot handle a node
+    // falls back silently and per-node. Either list alone hides that.
+    ["Active", providerList(hw.active_providers) ?? "not reported"],
+    ["Build offers", providerList(hw.providers) ?? "not reported"],
+    ["Smoke check", smokeCell(hw.smoke_check) ?? "not reported"],
+    ["Runtime", [hw.runtime, hw.onnxruntime_version].filter(Boolean).join(" ") || null],
+    ["CPUs", hw.cpu_count ?? null],
+  ]);
 }
 
 function renderDetail() {
@@ -255,6 +317,8 @@ function renderDetail() {
     ["Last seen", `${ago(device.last_seen)} (${device.connectivity})`],
     ["Message", device.message],
   ]);
+
+  renderHardware(device);
 
   // Pre-select what is deployed, so the picker opens on the truth rather than on
   // whatever happened to be first in the registry -- but only when the panel

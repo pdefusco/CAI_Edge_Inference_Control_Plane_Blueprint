@@ -16,6 +16,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from lighthouse_contracts import (
+    GPU_PROVIDERS,
+    Acceleration,
     ActualState,
     Connectivity,
     DesiredState,
@@ -110,6 +112,34 @@ def derive_governance(
     return GovernanceStatus.HEALTHY
 
 
+def derive_acceleration(actual: ActualDeploymentRow | None) -> Acceleration:
+    """Whether the device's loaded session is on its accelerator.
+
+    Reads `active_providers` and **only** `active_providers`. The sibling
+    `providers` key says what the installed onnxruntime build *could* do, and
+    the gap between them is the entire hazard: a provider that cannot handle a
+    node falls back to the CPU silently and per-node, so a device can report
+    CUDA as available while running the model on its CPU. Deriving this from
+    `providers` would make a fleet-wide CPU fallback look like a fleet on the
+    GPU -- which is the single most expensive thing this field could get wrong,
+    because it is also the most reassuring.
+
+    Stored nowhere, like everything else in this module: it is a reading of the
+    last heartbeat, and a persisted copy would outlive the fact.
+    """
+    if actual is None:
+        return Acceleration.UNKNOWN
+    active = actual.hardware.get("active_providers")
+    # `isinstance` rather than truthiness alone: this dict came back out of a
+    # JSON column, so a malformed or hand-edited row must read as "not
+    # reported" rather than raise inside a fleet listing.
+    if not isinstance(active, list) or not active:
+        return Acceleration.UNKNOWN
+    if any(provider in GPU_PROVIDERS for provider in active):
+        return Acceleration.ACCELERATED
+    return Acceleration.CPU_ONLY
+
+
 def build_device_view(
     device: DeviceRow,
     desired: DesiredDeploymentRow | None,
@@ -145,4 +175,8 @@ def build_device_view(
         inference_running=actual.inference_running if actual else False,
         artifact_ready=artifact_ready,
         message=actual.message if actual else None,
+        # Copied, not aliased: the row's dict belongs to the repository layer and
+        # a view handed out by reference is a mutation waiting to happen.
+        hardware=dict(actual.hardware) if actual else {},
+        acceleration=derive_acceleration(actual),
     )

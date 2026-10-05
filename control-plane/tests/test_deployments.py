@@ -669,22 +669,67 @@ def test_a_failure_message_reaches_the_operator_view(admin, agent, device):
     assert view["message"] == "onnxruntime refused the graph"
 
 
-def test_hardware_metadata_round_trips(agent, device):
+def test_hardware_metadata_round_trips(admin, agent, device):
     """Free-form by design (SS7 defers richer telemetry), so an agent adding a
-    field must not need a server change."""
+    field must not need a server change.
+
+    This used to assert only the 200, because it could not assert anything else:
+    the server stored the dict in `actual_deployment.hardware_json` and no read
+    path ever handed it back, so the Phase 6 acceptance fields were reachable
+    only from the device's journal or by opening SQLite. The second half of this
+    test is the thing that was missing -- every key the device sent, including
+    ones no schema names, arriving intact in the operator view.
+    """
+    sent = {
+        "platform": "jetson-orin-nano",
+        "gpu_available": True,
+        "jetpack": "6.0",
+        "tegra_temp_c": 44.5,
+        "active_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "smoke_check": "passed",
+    }
     response = agent.post(
-        f"/api/v1/devices/{DEVICE_ID}/heartbeat",
-        json=heartbeat(
-            hardware={
-                "platform": "jetson-orin-nano",
-                "gpu_available": True,
-                "jetpack": "6.0",
-                "tegra_temp_c": 44.5,
-            }
-        ),
+        f"/api/v1/devices/{DEVICE_ID}/heartbeat", json=heartbeat(hardware=sent)
     )
 
     assert response.status_code == 200
+
+    view = admin.get(f"/api/v1/devices/{DEVICE_ID}").json()
+    assert view["hardware"] == sent
+    assert view["acceleration"] == "ACCELERATED"
+
+
+def test_a_cuda_build_serving_on_the_cpu_is_reported_as_cpu_only(admin, agent, device):
+    """The trap §7 of `docs/jetson-setup.md` is written around.
+
+    `providers` says the build *could* use CUDA; `active_providers` says the
+    loaded session is not. A read that trusted the first would show a fleet-wide
+    silent fallback to the CPU as a fleet on the GPU, which is the most
+    expensive possible way for this field to be wrong because it is also the
+    most reassuring.
+    """
+    beat(
+        agent,
+        generation=1,
+        state="RUNNING",
+        hardware={
+            "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            "active_providers": ["CPUExecutionProvider"],
+            "gpu_available": True,
+            "smoke_check": "passed",
+        },
+    )
+
+    view = admin.get(f"/api/v1/devices/{DEVICE_ID}").json()
+    assert view["acceleration"] == "CPU_ONLY"
+
+
+def test_a_device_that_reported_no_hardware_reads_unknown(admin, agent, device):
+    beat(agent, generation=1, state="RUNNING")
+
+    view = admin.get(f"/api/v1/devices/{DEVICE_ID}").json()
+    assert view["hardware"] == {}
+    assert view["acceleration"] == "UNKNOWN"
 
 
 def test_the_runtime_block_reaches_the_operator_view(admin, agent, device):

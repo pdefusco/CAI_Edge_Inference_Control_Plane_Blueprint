@@ -175,6 +175,27 @@ def test_nothing_the_gate_controls_is_visible_before_it_runs():
     )
 
 
+def test_every_element_app_js_reaches_for_exists_in_the_template():
+    """`$("typo")` is `null`, and `null` fails at the first use, not at the typo.
+
+    There is no build step and no type checker between these two files, so a
+    renamed or mistyped id is a runtime `TypeError` deep inside a render -- which
+    takes out everything after it in the same function. The dashboard would show
+    a stale panel rather than an error, because the exception never reaches the
+    page. Asserting the whole set rather than a list anyone has to maintain, so a
+    new id is covered the moment it is written.
+    """
+    referenced = set(re.findall(r"""\$\(["']([\w-]+)["']\)""", _JS))
+    assert referenced, "no `$(\"id\")` calls found in static/app.js -- did `$` change?"
+    declared = set(re.findall(r"""\bid="([^"]+)\"""", _HTML))
+
+    missing = referenced - declared
+    assert not missing, (
+        f"static/app.js looks up {sorted(missing)} but templates/index.html "
+        "declares no such id"
+    )
+
+
 # -- what the browser actually receives -------------------------------------
 #
 # See the last paragraph of the module docstring. These render the page.

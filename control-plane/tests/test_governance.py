@@ -17,6 +17,8 @@ from datetime import timedelta
 
 import pytest
 from lighthouse_contracts import (
+    GPU_PROVIDERS,
+    Acceleration,
     ActualState,
     Connectivity,
     DesiredState,
@@ -27,6 +29,7 @@ from lighthouse.config import Settings
 from lighthouse.repositories import ActualDeploymentRow, DesiredDeploymentRow, DeviceRow
 from lighthouse.services.governance import (
     build_device_view,
+    derive_acceleration,
     derive_connectivity,
     derive_governance,
 )
@@ -67,6 +70,7 @@ def actual(
     version: str | None = "1",
     sha: str | None = SHA_A,
     running: bool = True,
+    hardware: dict | None = None,
 ) -> ActualDeploymentRow:
     return ActualDeploymentRow(
         device_id="d1",
@@ -76,6 +80,7 @@ def actual(
         model_version=version,
         artifact_sha256=sha,
         inference_running=running,
+        hardware=hardware if hardware is not None else {},
     )
 
 
@@ -388,6 +393,133 @@ def test_device_view_for_a_device_that_never_reported(settings):
     assert view.inference_running is False
     assert view.connectivity is Connectivity.NEVER_SEEN
     assert view.generation == 0
+
+
+# --------------------------------------------------------------------------
+# Acceleration: the Phase 6 acceptance field
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", sorted(GPU_PROVIDERS))
+def test_every_provider_in_the_shared_set_reads_accelerated(provider):
+    """Parametrized over `GPU_PROVIDERS` itself rather than a hand-copied list,
+    so adding a provider to the set cannot silently skip being tested here."""
+    row = actual(hardware={"active_providers": [provider, "CPUExecutionProvider"]})
+
+    assert derive_acceleration(row) is Acceleration.ACCELERATED
+
+
+def test_the_verdict_comes_from_active_providers_not_from_availability():
+    """The single most expensive thing this function could get wrong, because it
+    is also the most reassuring: a build that advertises CUDA while the loaded
+    session runs every node on the CPU. A provider that cannot handle a node
+    falls back silently and per-node, so availability is not evidence."""
+    row = actual(
+        hardware={
+            "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            "active_providers": ["CPUExecutionProvider"],
+            # The agent's own summary of the same availability list, and equally
+            # not evidence about the session.
+            "gpu_available": True,
+        }
+    )
+
+    assert derive_acceleration(row) is Acceleration.CPU_ONLY
+
+
+def test_coreml_and_azure_do_not_count_as_the_accelerator():
+    """Both are non-CPU and neither is what the gate asks about: Azure is a
+    *remote* inference endpoint, and CoreML does use a GPU but not a Jetson's.
+    The development MacBook reports exactly this list, so a `!=
+    "CPUExecutionProvider"` test would make a laptop pass the Jetson's gate."""
+    row = actual(
+        hardware={
+            "active_providers": [
+                "CoreMLExecutionProvider",
+                "AzureExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+        }
+    )
+
+    assert derive_acceleration(row) is Acceleration.CPU_ONLY
+
+
+@pytest.mark.parametrize(
+    "hardware",
+    [
+        pytest.param({}, id="no hardware at all -- an agent that sent none"),
+        pytest.param({"platform": "Linux-aarch64"}, id="hardware but no providers key"),
+        pytest.param({"active_providers": []}, id="an empty list"),
+        pytest.param({"active_providers": None}, id="an explicit null"),
+        pytest.param({"active_providers": "CUDAExecutionProvider"}, id="a bare string"),
+        pytest.param({"active_providers": {"0": "CUDA"}}, id="a hand-edited object"),
+    ],
+)
+def test_nothing_reported_reads_unknown_rather_than_cpu_only(hardware):
+    """`UNKNOWN` is not padding. A `mock` runtime, an agent with no session
+    loaded, and an agent too old to send the key all land here, and calling any
+    of them `CPU_ONLY` would be a confident claim about hardware nobody
+    measured. The gate fails them either way -- not proven is not passed -- but
+    it is a different sentence, and the difference is what says whether to go
+    look at the wheel or at the agent.
+
+    The last three cases came out of a JSON column and could have been
+    hand-edited, so they must read as "not reported" rather than raise inside a
+    listing of the whole fleet.
+    """
+    assert derive_acceleration(actual(hardware=hardware)) is Acceleration.UNKNOWN
+
+
+def test_a_device_that_never_reported_reads_unknown():
+    assert derive_acceleration(None) is Acceleration.UNKNOWN
+
+
+def test_a_cpu_only_device_is_still_healthy_governance(settings):
+    """The pair an operator has to be able to read, and the reason this is not a
+    `GovernanceStatus` value. This device downloaded the right bytes, loaded them
+    and is serving them, so it *is* in sync with what it was told -- and it is
+    failing Phase 6's acceptance check. A failed acceptance check that is
+    correctly HEALTHY governance; folding one into the other would break the only
+    thing governance means."""
+    device = DeviceRow(device_id="d1", registered_at=now_utc(), last_seen=now_utc())
+    row = actual(hardware={"active_providers": ["CPUExecutionProvider"], "smoke_check": "passed"})
+
+    view = build_device_view(device, desired(), row, settings)
+
+    assert view.governance_status is GovernanceStatus.HEALTHY
+    assert view.acceleration is Acceleration.CPU_ONLY
+
+
+def test_the_view_carries_the_hardware_dict_the_device_sent(settings):
+    """Keys no schema names included -- `active_providers`, `smoke_check` and
+    `device_model` appear in `HardwareInfo` nowhere, and they are the three the
+    acceptance check is about."""
+    device = DeviceRow(device_id="d1", registered_at=now_utc(), last_seen=now_utc())
+    reported = {
+        "device_model": "NVIDIA Orin Nano Developer Kit",
+        "active_providers": ["TensorrtExecutionProvider", "CPUExecutionProvider"],
+        "smoke_check": "passed",
+        "tegra_temp_c": 44.5,
+    }
+
+    view = build_device_view(device, desired(), actual(hardware=reported), settings)
+
+    assert view.hardware == reported
+    assert view.acceleration is Acceleration.ACCELERATED
+
+
+def test_the_view_does_not_hand_out_the_rows_own_dict(settings):
+    """The row's dict belongs to the repository layer, and the in-memory store
+    hands back live rows. A view sharing that object would let anything holding
+    the view mutate what the next read reports."""
+    device = DeviceRow(device_id="d1", registered_at=now_utc(), last_seen=now_utc())
+    row = actual(hardware={"smoke_check": "passed"})
+
+    view = build_device_view(device, desired(), row, settings)
+    view.hardware["smoke_check"] = "failed: tampered with"
+
+    assert row.hardware["smoke_check"] == "passed"
 
 
 def test_device_view_surfaces_the_failure_message(settings):

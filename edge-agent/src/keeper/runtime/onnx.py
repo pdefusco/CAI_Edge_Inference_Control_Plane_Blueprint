@@ -29,6 +29,8 @@ import platform
 from pathlib import Path
 from typing import Any
 
+from lighthouse_contracts import GPU_PROVIDERS
+
 from .base import InferenceRuntimeError, ModelLoadError, ModelStartError
 
 log = logging.getLogger(__name__)
@@ -40,27 +42,19 @@ _PREFERRED_PROVIDERS = (
     "CPUExecutionProvider",
 )
 
-# What `gpu_available` is allowed to mean: a provider that offloads to a discrete
-# or integrated GPU. An allow-list and not `!= "CPUExecutionProvider"`, which is
-# what this used to be and which is wrong in both directions.
+# What `gpu_available` is allowed to mean lives in `lighthouse_contracts` as
+# `GPU_PROVIDERS`, because the control plane now derives `DeviceView.acceleration`
+# from the same set and two copies of this judgement would drift in exactly the
+# direction that makes a CPU-only Jetson look healthy. The reasoning for the
+# membership is in that module; the measurement behind it belongs here, where it
+# was taken:
 #
 # Measured on the development MacBook 2026-10-04, where onnxruntime reports
-# `['CoreMLExecutionProvider', 'AzureExecutionProvider', 'CPUExecutionProvider']`:
-# the old test called that a GPU twice over. `AzureExecutionProvider` is a remote
-# inference endpoint and is not local acceleration at all, and CoreML -- which
-# genuinely does use the GPU -- is still not the thing this field is asked about.
-# The question the dashboard is really asking is "is this device using the
-# accelerator it was bought for", and a MacBook answering yes makes the column
-# useless for the Jetson fleet it exists to watch.
-_GPU_PROVIDERS = frozenset(
-    {
-        "TensorrtExecutionProvider",
-        "CUDAExecutionProvider",
-        "ROCMExecutionProvider",
-        "MIGraphXExecutionProvider",
-        "DmlExecutionProvider",
-    }
-)
+# `['CoreMLExecutionProvider', 'AzureExecutionProvider', 'CPUExecutionProvider']`.
+# An earlier version of this was `!= "CPUExecutionProvider"`, which called that a
+# GPU twice over -- `AzureExecutionProvider` is a remote inference endpoint and
+# not local acceleration at all, and CoreML, which genuinely does use the GPU, is
+# still not the accelerator a Jetson fleet is being watched for.
 
 # Declared input types the smoke check will invent a zero for.
 #
@@ -388,7 +382,7 @@ class OnnxRuntime:
         try:
             providers = self._ort.get_available_providers()
             info["providers"] = providers
-            info["gpu_available"] = any(p in _GPU_PROVIDERS for p in providers)
+            info["gpu_available"] = any(p in GPU_PROVIDERS for p in providers)
             info["onnxruntime_version"] = self._ort.__version__
         except Exception:  # pragma: no cover - never break a heartbeat
             info["gpu_available"] = None

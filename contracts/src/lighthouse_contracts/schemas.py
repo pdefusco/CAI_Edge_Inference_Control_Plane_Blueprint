@@ -15,6 +15,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .enums import (
+    Acceleration,
     ActualState,
     ArtifactFormat,
     Connectivity,
@@ -205,6 +206,25 @@ class DeviceView(Strict):
     inference_running: bool = False
     artifact_ready: bool = True
     message: str | None = None
+
+    # The device's own self-description, verbatim from its last heartbeat's
+    # `hardware`. Before this existed the control plane stored the dict in
+    # `actual_deployment.hardware_json` and nothing ever read it back, so the
+    # Phase 6 acceptance gate -- `active_providers` and `smoke_check` -- was
+    # only checkable from the device's journal or by opening SQLite by hand.
+    #
+    # A `dict` rather than `HardwareInfo`, deliberately: it was already
+    # validated as `HardwareInfo` on the way in, the store round-trips it as
+    # JSON, and re-validating it at read time can only turn one cosmetic field
+    # from one device into a 500 on the whole fleet view. `HardwareInfo` allows
+    # extra keys anyway, so the fields that matter most here -- `active_providers`,
+    # `smoke_check`, `device_model` -- appear in no schema either way.
+    hardware: dict[str, Any] = Field(default_factory=dict)
+
+    # The one judgement derived from that dict, because it must not be derived
+    # three times. See `Acceleration` for why this cannot live inside
+    # `governance_status`.
+    acceleration: Acceleration = Acceleration.UNKNOWN
 
 
 class AuditEventView(Strict):

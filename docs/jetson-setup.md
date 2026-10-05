@@ -232,7 +232,9 @@ check failing:
 3. the ONNX graph loaded;
 4. it **executed once** -- the `smoke inference ... returned N output(s)` line, or
    `smoke_check: passed` in the heartbeat;
-5. the reported execution provider is **not CPU-only**.
+5. the reported execution provider is **not CPU-only** -- `ACCEL: ACCELERATED`,
+   and `UNKNOWN` is not a pass: it means nothing was measured, which is a
+   different problem from a measured CPU fallback but not a better one.
 
 ### Where to read the provider list
 
@@ -242,22 +244,36 @@ On the device, which is the direct evidence:
 journalctl -u keeper | grep -E 'with providers|smoke inference'
 ```
 
-From the control plane, which is what the fleet actually received. **Note the gap
-here:** the heartbeat carries `hardware` and the control plane stores it, but
-`DeviceView` does not expose it, so neither the dashboard nor `make device` shows
-the provider list. Until something surfaces it, read it out of SQLite:
+From the control plane, which is what the fleet actually received -- three views of
+the same heartbeat, in increasing detail:
 
 ```
-python - <<'PY'
-import json, sqlite3
-db = sqlite3.connect("<data_dir>/lighthouse.db")
-db.row_factory = sqlite3.Row
-for r in db.execute("SELECT device_id, actual_state, hardware_json FROM actual_deployment"):
-    print(r["device_id"], r["actual_state"], json.dumps(json.loads(r["hardware_json"] or "{}"), indent=2))
-PY
+make fleet                      # one ACCEL column per device
+make device DEVICE=<device-id>  # the whole `hardware` dict as the device sent it
 ```
 
-The two fields that matter in that JSON:
+and the dashboard's **Hardware** card in the device detail panel, which shows the
+acceleration verdict, both provider lists and the smoke check side by side.
+
+`ACCEL` and the card's Acceleration row are the same derived field,
+`DeviceView.acceleration`: `ACCELERATED`, `CPU_ONLY`, or `UNKNOWN` when nothing
+was reported at all. It is derived server-side from `active_providers` so that
+this judgement has one home rather than being re-made in the dashboard, in
+`make fleet` and in an operator's head -- `Acceleration` in
+`contracts/src/lighthouse_contracts/enums.py` carries the reasoning, including
+why `CoreMLExecutionProvider` and `AzureExecutionProvider` do **not** count.
+
+Read `GOVERNANCE` and `ACCEL` as a pair. `HEALTHY` + `CPU_ONLY` is the trap: the
+device downloaded the right bytes, loaded them and is serving them, so it is
+genuinely in sync with its desired state -- and it is failing this check. A
+correctly green governance badge is not evidence for item 5.
+
+Earlier revisions of this section said `DeviceView` did not expose `hardware` and
+gave a `sqlite3` snippet to read `actual_deployment.hardware_json` by hand. That
+gap is closed; the snippet is gone because it was reading a column that the API
+now serves verbatim.
+
+The two fields that matter inside `hardware`:
 
 * **`active_providers`** -- what the loaded session is *actually* using. This is
   the gate. `providers` next to it only says what the installed build *could* do,

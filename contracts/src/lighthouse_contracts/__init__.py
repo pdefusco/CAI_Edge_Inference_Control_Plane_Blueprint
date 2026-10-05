@@ -7,6 +7,8 @@ installed on the Jetson.
 """
 
 from .enums import (
+    GPU_PROVIDERS,
+    Acceleration,
     ActualState,
     ArtifactFormat,
     Connectivity,
@@ -37,6 +39,8 @@ from .schemas import (
 )
 
 __all__ = [
+    "GPU_PROVIDERS",
+    "Acceleration",
     "ActualState",
     "ArtifactFormat",
     "ArtifactRef",

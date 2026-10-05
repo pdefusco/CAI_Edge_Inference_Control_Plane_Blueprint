@@ -37,7 +37,8 @@ import pytest
 from conftest import FASHION_ONNX_BASE64, make_archive
 
 from keeper.runtime.base import InferenceRuntimeError, ModelLoadError, ModelStartError
-from keeper.runtime.onnx import _GPU_PROVIDERS, OnnxRuntime, _zeros
+from lighthouse_contracts import GPU_PROVIDERS
+from keeper.runtime.onnx import OnnxRuntime, _zeros
 
 # Module-level so a direct `pytest -m onnx` on a machine without the wheel skips
 # the file instead of erroring on the import. The marker is what keeps it out of
@@ -347,7 +348,7 @@ class TestHardwareInfo:
         not, the device is running on the CPU of a machine bought for its GPU.
         """
         info = runtime.hardware_info()
-        accelerated = [p for p in info["providers"] if p in _GPU_PROVIDERS]
+        accelerated = [p for p in info["providers"] if p in GPU_PROVIDERS]
         assert info["gpu_available"] is bool(accelerated)
         if not accelerated:
             # Spelled out so the failure is readable on a dev laptop: a provider

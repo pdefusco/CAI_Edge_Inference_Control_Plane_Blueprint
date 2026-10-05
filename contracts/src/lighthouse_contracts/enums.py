@@ -84,6 +84,64 @@ class Connectivity(StrEnum):
     NEVER_SEEN = "NEVER_SEEN"
 
 
+# Execution providers that mean "this device is using the accelerator it was
+# bought for". Deliberately narrower than "anything but the CPU provider":
+# `CoreMLExecutionProvider` and `AzureExecutionProvider` are both non-CPU and
+# neither is local GPU acceleration -- Azure is a *remote* inference endpoint,
+# and the laptop this repo was written on reports it. A MacBook answering "yes"
+# makes the field useless for the Jetson fleet it exists to watch.
+#
+# This is the single home for that judgement on purpose. The agent reports
+# `hardware.gpu_available` from it and the control plane derives `Acceleration`
+# from it, and two copies would drift in exactly the direction that makes a
+# CPU-only Jetson look healthy.
+GPU_PROVIDERS = frozenset(
+    {
+        "TensorrtExecutionProvider",
+        "CUDAExecutionProvider",
+        "ROCMExecutionProvider",
+        "MIGraphXExecutionProvider",
+        "DmlExecutionProvider",
+    }
+)
+
+
+class Acceleration(StrEnum):
+    """Whether a device's *loaded session* is on its accelerator (spec Phase 6).
+
+    Derived at read time from the last heartbeat's `hardware.active_providers`.
+    The Phase 6 acceptance gate is `ACCELERATED` **and** `smoke_check: passed`;
+    `docs/jetson-setup.md` §7 is the sequence.
+
+    This needs its own field because `GovernanceStatus` cannot answer it and
+    must not try. A device that downloaded the right bytes, loaded them and is
+    serving them *is* in sync with its desired state -- whether it is using the
+    GPU or not. So a Jetson bought for its GPU and serving on its CPU is a
+    **failed acceptance check that is correctly HEALTHY governance**, and
+    special-casing that inside `HEALTHY` would break the one thing governance
+    means.
+
+    Three values, and the third is not padding:
+
+    * `ACCELERATED` -- at least one active provider is in `GPU_PROVIDERS`.
+    * `CPU_ONLY` -- providers were reported and none of them qualify. Named for
+      the acceptance criterion's own wording; note it also covers the CoreML and
+      Azure cases above, which are not literally CPU but are equally not the
+      accelerator the gate asks about.
+    * `UNKNOWN` -- nothing was reported. A `mock` runtime, an agent with no
+      session loaded, and an agent too old to send the key all land here, and
+      calling any of them `CPU_ONLY` would be a confident claim about hardware
+      nobody measured. The gate treats `UNKNOWN` as a failure all the same --
+      not proven is not passed -- but it is a different sentence, and the
+      difference is what tells an operator whether to look at the wheel or at
+      the agent.
+    """
+
+    ACCELERATED = "ACCELERATED"
+    CPU_ONLY = "CPU_ONLY"
+    UNKNOWN = "UNKNOWN"
+
+
 class ArtifactFormat(StrEnum):
     """ONNX is the canonical edge format (spec SS10). TensorRT engines are
     derived on-device in M6 and are not registry artifacts.

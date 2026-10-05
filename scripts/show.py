@@ -62,19 +62,30 @@ def fleet(rows: list[dict]) -> None:
     if not rows:
         print("  no devices enrolled (make enroll)")
         return
-    header = f"{'DEVICE':<20}{'LINK':<11}{'GOVERNANCE':<15}{'DESIRED':<22}{'ACTUAL':<22}LAST SEEN"
+    header = (
+        f"{'DEVICE':<20}{'LINK':<11}{'GOVERNANCE':<15}"
+        f"{'DESIRED':<22}{'ACTUAL':<22}{'ACCEL':<13}LAST SEEN"
+    )
     print(header)
     print("-" * len(header))
     for row in rows:
         # Desired and actual stay in separate columns here for the same reason they
         # do in the dashboard: collapsing them into one "status" would delete the
         # only interesting information on the line.
+        #
+        # ACCEL is next to GOVERNANCE because the pair is the thing worth reading:
+        # `HEALTHY` + `CPU_ONLY` is a device doing exactly what it was told while
+        # failing the acceptance check this fleet exists to pass, and it is the one
+        # combination that looks fine device-by-device and wrong across a fleet.
+        # The full enum value, unabbreviated -- a `GPU`/`CPU` shorthand invented
+        # here would be a third spelling of a judgement that has one home.
         print(
             f"{row['device_id']:<20}"
             f"{row['connectivity']:<11}"
             f"{row['governance_status']:<15}"
             f"{_pair(row.get('desired_state'), row.get('desired_model_version')):<22}"
             f"{_pair(row.get('actual_state'), row.get('actual_model_version')):<22}"
+            f"{row.get('acceleration') or 'UNKNOWN':<13}"
             f"{_age(row.get('last_seen'))}"
         )
 

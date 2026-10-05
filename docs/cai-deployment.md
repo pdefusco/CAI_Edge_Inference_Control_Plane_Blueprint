@@ -242,10 +242,12 @@ not route to yields an app that looks healthy and answers nobody.
 Observed 2026-10-04: with that third candidate in place the Application bound
 8090 and logged `Uvicorn running on http://0.0.0.0:8090`. Note where the value
 came from — a **sibling** workload's `SERVICE_PORT_APP`, because this workload
-exposes no app service port of its own. **Open question. Measure it; do not
-assume it.** That 8090 was free and bindable is observed. That the public URL
-routes to 8090 is not, and the sibling provenance is exactly the reason to doubt
-it. §6's probe is that check, and it is the first thing to run.
+exposes no app service port of its own. That 8090 was free and bindable is
+observed; that the public URL routed to it was the open question, and the
+sibling provenance was exactly the reason to doubt it. **It has since been
+measured, and the answer was no** — two paragraphs down. The reasoning is kept
+because it is the general shape of the trap: a bind that succeeds says nothing
+about a route.
 
 Also observed 2026-10-04, and it is evidence *against* 8090: the sibling was a
 **Session**. A CAI shell prompt is `cdsw@<workload-id>`, and the id in the
@@ -284,7 +286,7 @@ authentication off first, then curl, then read:
 | Result | Meaning |
 | --- | --- |
 | The health JSON | The subdomain routes to the port we bound. Nothing more to fix; run §6's probe. |
-| `502`, `content-length: 0`, `server: istio-envoy` | The route points at a port our process is not on. Fix the port variables, below. |
+| `502`, `content-length: 0`, `server: istio-envoy` | The route points at a port our process is not on. Read the Application's log for which port and address it won, then "The fix", below. |
 | `curl: (52)`/`(56)`, or 503 with no `upstream-service-time` | No upstream at all — the Application is not running. Read its log, not the URL. |
 
 Use `-sS`, never bare `-s`: `-s` suppresses curl's own errors as well as
@@ -314,12 +316,60 @@ first candidate and CML's route together.
 
 **So 8100 is the port CAI routes to, and the engine holding it is the bug.**
 That is what the 502 and the absence of any override leave: the ingress is aimed
-at the port CAI always meant, our process cannot have it, and `app.py`'s
-fallback to 8090 wins a port nothing routes to. The fix is the runtime, below —
-not the variables, and not anything an entry script can do.
+at the port CAI always meant, and `app.py`'s fallback to 8090 wins a port nothing
+routes to.
 
-**Choose a runtime whose editor is not Jupyter-backed.** Every surprise in §3
-is one consequence of a single cause, and the holder's command line names it:
+### The fix: take the routed port on a different address
+
+**Measured 2026-10-05: the Application serves, and `/api/v1/health` answers
+through the public URL** (the response is quoted in §5). What changed was one
+thing — `app.py` now tries each candidate port on `0.0.0.0` **and then on
+`127.0.0.1`**, instead of giving up on a port when the wildcard is refused.
+
+Two facts make that work, and both were things this document previously had
+backwards:
+
+* **A loopback bind is reachable.** CAI proxies an Application from inside its
+  own pod, which is what `CDSW_APP_PORT` meaning "the port the engine proxies a
+  workload through" implies, and what a sibling blueprint demonstrates: its
+  `deploy/cai/start.py` sets `BIND_HOST=127.0.0.1` on `CDSW_APP_PORT` and is
+  reachable in production. An earlier version of `app.py` asserted the opposite
+  — that only `0.0.0.0` could be reached "from a proxy in another container" —
+  and that single wrong sentence is what kept the routed port out of reach.
+* **A refused wildcard does not mean a taken port.** On Linux a `0.0.0.0` bind
+  collides with a holder of *any* specific address on that port. So
+  `0.0.0.0:8100` failing `EADDRINUSE` is equally consistent with the gateway
+  holding one specific address and `127.0.0.1:8100` being free. Probing only the
+  wildcard cannot tell those apart, and reported 8100 "taken" without ever
+  testing the address that was available.
+
+So the ordering is: prefer the **port** CAI routes to, then find an address on
+it. Winning 8100 on loopback beats winning 8090 on the wildcard, because the
+second is unreachable by construction. `app.py` exports the winning host as
+`LIGHTHOUSE_HOST` alongside `PORT`, which is required rather than tidy —
+`main.py:303` defaults a non-`local` env to `0.0.0.0` and would otherwise
+re-raise the very `EADDRINUSE` the probe just avoided.
+
+Read your own log to see which branch won, because the two look nothing alike:
+`serving on 8100 (CDSW_APP_PORT) bound to 127.0.0.1 rather than 0.0.0.0` is the
+good outcome, while any message containing `expect a 502` means a fallback took
+an unrouted port. That the winning branch is the loopback one is deduction, not
+yet a pasted log line: `0.0.0.0:8100` was observed refused before the change, so
+no other candidate in `app.py` can account for the URL starting to serve — but
+confirm it from the log rather than trusting this paragraph.
+
+Note also that a `127.0.0.1` bind is *narrower* than the wildcard, not a
+workaround with a cost: only the in-pod proxy can reach it, so nothing in the
+cluster's network can address the Application directly.
+
+### If that does not work: choose a runtime whose editor is not Jupyter-backed
+
+This was the presumed fix before the address fallback landed, and it remains the
+answer when the gateway holds the wildcard — in which case no bind on any
+address can win, and `app.py`'s table will say so with `8100 on 0.0.0.0`.
+
+Every surprise in §3 is one consequence of a single cause, and the holder's
+command line names it:
 `/var/lib/cdsw/deps/engine-init /var/lib/cdsw/deps/jupyter-wsg-launcher` — a
 Jupyter *websocket gateway*, which a workload only runs when its runtime executes
 code through a kernel rather than as a process. That one fact accounts for the
@@ -328,8 +378,8 @@ before our script starts. A non-kernel editor should define `__file__`, start no
 loop, and leave `CDSW_APP_PORT` free, making all three workarounds in `app.py`
 inert rather than necessary.
 
-**Open question. Measure it; do not assume it.** The kernel behaviour and the
-gateway on 8100 are observed (2026-10-04, four separate failures). That a
+**Open question, and no longer on the critical path.** The kernel behaviour and
+the gateway on 8100 are observed (2026-10-04, four separate failures). That a
 different editor avoids it is inference from how those line up — strong, but not
 measured, and it may not even be offered: ML Runtime catalogs have been dropping
 non-PBJ editors, so check what the Editor dropdown actually lists before
@@ -337,16 +387,28 @@ planning around it. The test is cheap and the first lines of the log give it
 away: point a second Application at the same `app.py` on a candidate runtime,
 and if this docstring comes back echoed as cell output, it is still a kernel.
 
-If no non-kernel editor is available, the remaining options are all outside what
-an entry script can reach: ask whether CAI will route the Application to a port
-you nominate, or run the control plane as a long-running **Job** or **Session**
-rather than an Application and reach it by whatever URL that exposes. Both are
-unexplored here.
+Since the address fallback works, a non-kernel runtime is now a simplification
+rather than a fix — it would make all three workarounds in `app.py` inert. Worth
+doing if you are choosing a runtime anyway; not worth blocking on.
 
-`app.py` prints what all of this needs, on the failure path only: the holder's
-pid and command line, every `*PORT*` variable whose value is a bare number, and
-every port listening in the container with its owner. Read those before changing
-anything. Two filters on that dump are deliberate and should stay: non-port
+If the gateway *does* hold the wildcard, what is left is outside an entry
+script's reach: ask whether CAI will route the Application to a port you
+nominate, or run the control plane as a long-running **Job** or **Session**
+rather than an Application and reach it by whatever URL that exposes. Both are
+unexplored here. Note that the earlier version of this paragraph claimed the
+entry script had already exhausted its options, which was wrong — binding the
+routed port on another address was available the whole time and nobody had tried
+it.
+
+`app.py` prints what all of this needs — the holder's pid and command line,
+every `*PORT*` variable whose value is a bare number, and every port listening
+in the container with the address it is bound to and its owner. It prints on the
+failure path *and* whenever a fallback wins, which matters: a fallback that
+succeeds is the quiet-wrong case, serving happily on a port nothing routes to,
+and for a while that was the one case whose table was unavailable precisely
+because nothing had failed. Read those before changing anything.
+
+Two filters on that dump are deliberate and should stay: non-port
 `CDSW_*` is excluded because it carries the workbench domain and CRNs, and
 non-numeric values are excluded because service discovery sets
 `<SERVICE>_PORT=tcp://172.x.y.z:8100` and `..._TCP_ADDR=172.x.y.z` for every
@@ -369,9 +431,21 @@ Observed 2026-10-04: the Application reached this state on 8090 after the three
 failures above. Do not "fix" the hang. The next thing to check is the URL, not
 the log.
 
-**Set neither port variable yourself**, and leave `LIGHTHOUSE_HOST` unset too:
-`main.py:298` already binds `0.0.0.0` whenever the env is not `local`, which a
-loopback proxy reaches.
+Read the port and address in that line rather than matching it literally: 8090
+is what the fallback won *before* the address fix, and a correct start now reads
+`http://127.0.0.1:8100` — the routed port, on the address the in-pod proxy uses.
+A hang on 8090 is a live process nothing routes to, which is the whole subject of
+the section above.
+
+**Leave the port variables and `LIGHTHOUSE_HOST` unset**, but not because they
+are inert — because `app.py` sets both itself, from a bind it actually tested.
+Setting either by hand replaces a measurement with a guess: `CDSW_APP_PORT` moves
+the first candidate (and CML's route with it), `CDSW_READONLY_PORT` moves the
+second, and `LIGHTHOUSE_HOST` narrows the probe to the one address you named, so
+a wrong value turns the two-address fallback off. Observed 2026-10-04: a hand-set
+`CDSW_READONLY_PORT=8090` does take effect — an earlier version of this document
+said these variables could not be set from the UI, which was wrong — it just
+wins a port nothing routes to.
 
 **That 8000 fallback is a laptop-only convenience, and it bites in a Session.**
 Port 8000 inside a CAI Session is held by something outside your namespace: the
@@ -466,16 +540,32 @@ what the project actually has.
 
 ## 5. Does the Application have the registry's credential?
 
-**Open question. Measure it; do not assume it.**
+**Measured 2026-10-05, and the answer is yes.** `/api/v1/health` on a deployed
+Application, curled from a Session, returned
+
+```
+{"status":"ok","version":"0.1.0","registry":"cai","registry_reachable":true,
+ "device_count":0,"server_time":"2026-10-05T01:19:58.685335Z"}
+```
+
+`registry_reachable: true` beside `registry: cai` is the whole answer: per the
+reasoning at the end of this section, that field is a real authenticated fetch of
+`/models`, so the `cdp iam generate-workload-auth-token` chain **does** work
+inside an Application container, not only in a Session. No
+`LIGHTHOUSE_REGISTRY_TOKEN_SOURCE` override was needed, and the `cli` default
+stands.
+
+What that does *not* settle is expiry. The measurement is one point in time on a
+freshly started Application, and the whole argument for `cli` over `env`/`file`
+is refresh — so a `registry_reachable` that is `true` at boot and `false` days
+later is the failure this does not rule out. Re-read the field, don't assume it.
 
 `registry_token_source=cli` shells out to `cdp iam generate-workload-auth-token
---workload-name DE` (`registry/cai.py:161-194`). That chain is **verified in a CAI
-Session**. Whether a CAI *Application* container has the `cdp` CLI on `PATH` and a
-workload identity configured was not verified in this milestone —
-`registry/cai.py:163` says "a CAI Session/Application", and only the Session half
-was observed.
+--workload-name DE` (`registry/cai.py:161-194`), which `registry/cai.py:163`
+describes as working in "a CAI Session/Application". Both halves are now
+observed.
 
-Check it from inside the Application's own environment before relying on it:
+To check it directly from inside the Application's own environment:
 
 ```
 which cdp && cdp iam generate-workload-auth-token --workload-name DE >/dev/null && echo ok
@@ -549,6 +639,16 @@ The last three are **findings, not failures of this document.** Record what you
 saw; the device-side setup (`docs/jetson-setup.md`) depends on which row you are
 in.
 
+**Measured 2026-10-05: the in-Session baseline passes.** `/api/v1/health` on the
+public URL, curled from a terminal in a CAI Session, returns the health JSON
+(quoted in §5) rather than a 302 or a 502. So with authentication disabled and
+the routed port won (§3), the app is not broken and the ingress is not gating —
+which is precisely what the baseline run exists to establish, and it means a
+failure in the off-VPN run would be about the *vantage point* and nothing else.
+Two things it does not cover, both still owed to `probe_app.py`: the off-VPN run
+itself, and whether a credential survives the ingress on either header, since
+health needs none.
+
 **Row 2 is where an authentication-enabled Application lands, and you do not
 need the VPN off to see it.** Observed 2026-10-04, curling
 `/api/v1/health` from a terminal in a CAI **Session** — the baseline run, inside
@@ -603,8 +703,11 @@ needed to.
 ## 7. Confirm it from outside
 
 ```
-curl -s https://<app-url>/api/v1/health
+curl -sS https://<app-url>/api/v1/health
 ```
+
+`-sS`, not bare `-s`, for the reason §3 gives: `-s` hides curl's own errors, so
+a reset connection and an empty-bodied 502 both read as success with no output.
 
 Expect JSON naming the version, the selected registry and the env — `registry`
 should read `cai`, not `fake`. Read `registry_reachable` in the same response:

@@ -236,9 +236,32 @@ check failing:
    and `UNKNOWN` is not a pass: it means nothing was measured, which is a
    different problem from a measured CPU fallback but not a better one.
 
+### Run it rather than reading it by eye
+
+```
+sudo scripts/accept.sh            # on the device; add --show-host to unmask the URL
+```
+
+It checks all five from the journal and the agent's own state file, prints the
+line it is relying on for each one, and exits non-zero unless all five hold.
+Read its header for the two judgements it makes that a grep cannot:
+
+* **every line is matched against the model the agent is serving right now**, so
+  a journal full of provider lines from the version before this one reads as no
+  evidence rather than as a pass -- and it says which version it found instead;
+* **three verdicts, not two.** `UNPROVEN` is "no evidence either way" -- a journal
+  that rotated past the deployment, a smoke check that was skipped -- and it is
+  kept apart from `FAIL` for the same reason `UNKNOWN` is kept apart from
+  `CPU_ONLY`. Neither one is a pass.
+
+It reads only: no unit is started or stopped, nothing is written, and it never
+reads the device token, which it has no use for. `sudo` is for the journal and
+for `/etc/keeper/keeper.env`, which is `0640 root:keeper`. The control-plane URL
+is masked unless you ask for it, so the output is safe to paste.
+
 ### Where to read the provider list
 
-On the device, which is the direct evidence:
+On the device, which is the direct evidence the script is quoting:
 
 ```
 journalctl -u keeper | grep -E 'with providers|smoke inference'
